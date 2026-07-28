@@ -9,6 +9,10 @@ pub struct SnapshotPayload {
     pub receipt_id: String,
     pub html: String,
     pub screenshot_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::provenance::ProvenanceResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_error: Option<String>,
 }
 
 impl SnapshotPayload {
@@ -29,6 +33,8 @@ impl SnapshotPayload {
             receipt_id,
             html,
             screenshot_base64,
+            provenance: None,
+            provenance_error: None,
         })
     }
 }

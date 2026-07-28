@@ -6,7 +6,7 @@ use crate::provenance::{ProvenanceClient, ResolverFetchEvidence};
 use crate::snapshot_upload::SnapshotPayload;
 use crate::types::{
     FetchWithReceipt, FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest,
-    ProductResponse, ProductRoute, Receipt,
+    ProductResponse, ProductRoute, ProvenanceOptions, Receipt,
 };
 use serde_json::Value;
 use spider_client::{
@@ -155,7 +155,22 @@ impl Fetcher {
         source: &str,
         auth_context: Option<&ResolverAuthContext>,
     ) -> Result<FetchWithReceipt, FetchError> {
-        let payload = ProductRequest::fast(source);
+        self.get_fast_data_with_receipt_with_options(
+            source,
+            auth_context,
+            ProvenanceOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn get_fast_data_with_receipt_with_options(
+        &self,
+        source: &str,
+        auth_context: Option<&ResolverAuthContext>,
+        options: ProvenanceOptions,
+    ) -> Result<FetchWithReceipt, FetchError> {
+        let mut payload = ProductRequest::fast(source);
+        payload.apply_provenance_options(options);
         let response = self
             .product_fetch_with_auth(payload, ProductRoute::Scrape, auth_context)
             .await?;
@@ -178,9 +193,24 @@ impl Fetcher {
         source: &str,
         auth_context: Option<&ResolverAuthContext>,
     ) -> Result<FetchWithReceipt, FetchError> {
+        self.get_unblock_data_with_receipt_with_options(
+            source,
+            auth_context,
+            ProvenanceOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn get_unblock_data_with_receipt_with_options(
+        &self,
+        source: &str,
+        auth_context: Option<&ResolverAuthContext>,
+        options: ProvenanceOptions,
+    ) -> Result<FetchWithReceipt, FetchError> {
         let mut payload = ProductRequest::fast(source);
         payload.mode = ProductMode::Unblock;
         payload.receipt = Some(true);
+        payload.apply_provenance_options(options);
         let response = self
             .product_fetch_with_auth(payload, ProductRoute::Unblock, auth_context)
             .await?;
@@ -199,6 +229,16 @@ impl Fetcher {
     }
 
     pub async fn snapshot_with_receipt(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
+        self.snapshot_with_receipt_with_options(source, None, ProvenanceOptions::default())
+            .await
+    }
+
+    pub async fn snapshot_with_receipt_with_options(
+        &self,
+        source: &str,
+        auth_context: Option<&ResolverAuthContext>,
+        options: ProvenanceOptions,
+    ) -> Result<SnapshotPayload, FetchError> {
         let formats = HashSet::from([ReturnFormat::Raw, ReturnFormat::Screenshot]);
         let params = RequestParams {
             return_format: Some(ReturnFormatHandling::Multi(formats)),
@@ -215,11 +255,48 @@ impl Fetcher {
             .await
             .map_err(FetchError::UnableFetch)?;
         let crawl = Self::normalize_value(data)?;
+        let mut snapshot = SnapshotPayload::from_spider_response(source, crawl.clone())
+            .map_err(FetchError::Snapshot)?;
+        if options.provenance || options.publish_to_arweave || options.register_onchain {
+            let mut payload = ProductRequest::fast(source);
+            payload.mode = ProductMode::Screenshot;
+            payload.apply_provenance_options(options);
+            let receipt = self.store_receipt(
+                source,
+                &crawl,
+                ProductMode::Screenshot.receipt_label(),
+                Self::request_type_name(ProductMode::Screenshot),
+                Self::proxy_name(&payload, ProductMode::Screenshot),
+            );
+            let (provenance, provenance_error) = self
+                .provenance_for(
+                    &payload,
+                    ProductRoute::Screenshot,
+                    ProductMode::Screenshot,
+                    &crawl,
+                    Some(&receipt),
+                    auth_context,
+                )
+                .await;
+            snapshot.receipt_id = receipt.id;
+            snapshot.provenance = provenance;
+            snapshot.provenance_error = provenance_error;
+        }
 
-        SnapshotPayload::from_spider_response(source, crawl).map_err(FetchError::Snapshot)
+        Ok(snapshot)
     }
 
     pub async fn unblocker(&self, source: &str) -> Result<serde_json::Value, FetchError> {
+        self.unblocker_with_options(source, None, ProvenanceOptions::default())
+            .await
+    }
+
+    pub async fn unblocker_with_options(
+        &self,
+        source: &str,
+        auth_context: Option<&ResolverAuthContext>,
+        options: ProvenanceOptions,
+    ) -> Result<serde_json::Value, FetchError> {
         let mut payload = ProductRequest::fast(source);
         payload.mode = ProductMode::Unblock;
         payload.timeout_secs = Some(50);
@@ -229,7 +306,8 @@ impl Fetcher {
         payload.fingerprint = Some(true);
         payload.scroll = Some(1);
         payload.receipt = Some(false);
-        self.product_fetch(payload, ProductRoute::Unblock)
+        payload.apply_provenance_options(options);
+        self.product_fetch_with_auth(payload, ProductRoute::Unblock, auth_context)
             .await
             .map(|response| response.data)
     }
@@ -243,8 +321,14 @@ impl Fetcher {
         receipt: Option<&Receipt>,
         auth_context: Option<&ResolverAuthContext>,
     ) -> (Option<crate::provenance::ProvenanceResult>, Option<String>) {
-        let Some(provenance) = self.provenance.as_ref() else {
+        if !payload.provenance_requested() {
             return (None, None);
+        }
+        let Some(provenance) = self.provenance.as_ref() else {
+            return (
+                None,
+                Some("provenance was requested but is unavailable".to_string()),
+            );
         };
 
         match provenance

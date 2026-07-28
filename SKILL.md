@@ -132,9 +132,18 @@ source:
 
 ```json
 {
-  "url": "https://example.com/article"
+  "url": "https://example.com/article",
+  "provenance": true,
+  "publish_to_arweave": false,
+  "register_onchain": false,
+  "wait_for_publication": false
 }
 ```
+
+The provenance/publication fields are per-request opt-ins. Publication options
+imply provenance. Arweave and registry publication are independently
+selectable; `wait_for_publication` requires at least one of them. Without
+waiting, Livy continues managed publication asynchronously.
 
 Do not search first, replace the URL, or infer a different source. Pass
 the exact URL and use the returned content plus receipt metadata.

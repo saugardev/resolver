@@ -12,12 +12,12 @@ use crate::credits::ResolverCreditsClient;
 use crate::errors::FetchError;
 use crate::fetch::Fetcher;
 use crate::types::{
-    FetchWithReceipt, ProductRequest, ProductResponse, ProductRoute, Receipt, validate_receipt_id,
-    validate_source_url,
+    FetchWithReceipt, ProductRequest, ProductResponse, ProductRoute, ProvenanceOptions, Receipt,
+    validate_receipt_id, validate_source_url,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 pub struct ApiJson<T>(pub T);
 
@@ -67,6 +67,22 @@ fn json_rejection_response(rejection: JsonRejection) -> Response {
 #[derive(Deserialize)]
 pub struct FetchRequest {
     pub source: String,
+    pub provenance: Option<bool>,
+    pub publish_to_arweave: Option<bool>,
+    pub register_onchain: Option<bool>,
+    pub wait_for_publication: Option<bool>,
+}
+
+impl FetchRequest {
+    fn provenance_options(&self) -> ProvenanceOptions {
+        ProvenanceOptions {
+            provenance: self.provenance == Some(true),
+            publish_to_arweave: self.publish_to_arweave == Some(true),
+            register_onchain: self.register_onchain == Some(true),
+            wait_for_publication: self.wait_for_publication == Some(true),
+        }
+        .normalized()
+    }
 }
 
 pub async fn fetch_post(
@@ -76,17 +92,22 @@ pub async fn fetch_post(
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Scrape)?;
-    debit_product_route(
-        &credits,
-        &auth_context,
-        ProductRoute::Scrape.as_str(),
-        payload.source.as_deref(),
-        None,
-    )
-    .await?;
+    let started = Instant::now();
+    let source = payload.source.clone();
+    let options = payload.provenance_options();
     let data = fetcher
         .product_fetch_with_auth(payload, ProductRoute::Scrape, Some(&auth_context))
         .await?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "fetch",
+        source.as_deref(),
+        None,
+        started,
+        options,
+    )
+    .await?;
     Ok(Json(data))
 }
 
@@ -97,17 +118,22 @@ pub async fn crawl_post(
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Crawl)?;
-    debit_product_route(
-        &credits,
-        &auth_context,
-        ProductRoute::Crawl.as_str(),
-        payload.source.as_deref(),
-        None,
-    )
-    .await?;
+    let started = Instant::now();
+    let source = payload.source.clone();
+    let options = payload.provenance_options();
     let data = fetcher
         .product_fetch_with_auth(payload, ProductRoute::Crawl, Some(&auth_context))
         .await?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "crawl",
+        source.as_deref(),
+        None,
+        started,
+        options,
+    )
+    .await?;
     Ok(Json(data))
 }
 
@@ -118,17 +144,22 @@ pub async fn map_post(
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Map)?;
-    debit_product_route(
-        &credits,
-        &auth_context,
-        ProductRoute::Map.as_str(),
-        payload.source.as_deref(),
-        None,
-    )
-    .await?;
+    let started = Instant::now();
+    let source = payload.source.clone();
+    let options = payload.provenance_options();
     let data = fetcher
         .product_fetch_with_auth(payload, ProductRoute::Map, Some(&auth_context))
         .await?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "map",
+        source.as_deref(),
+        None,
+        started,
+        options,
+    )
+    .await?;
     Ok(Json(data))
 }
 
@@ -139,17 +170,21 @@ pub async fn search_post(
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Search)?;
-    debit_product_route(
-        &credits,
-        &auth_context,
-        ProductRoute::Search.as_str(),
-        None,
-        None,
-    )
-    .await?;
+    let started = Instant::now();
+    let options = payload.provenance_options();
     let data = fetcher
         .product_fetch_with_auth(payload, ProductRoute::Search, Some(&auth_context))
         .await?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "search",
+        None,
+        None,
+        started,
+        options,
+    )
+    .await?;
     Ok(Json(data))
 }
 
@@ -160,17 +195,22 @@ pub async fn extract_post(
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Extract)?;
-    debit_product_route(
-        &credits,
-        &auth_context,
-        ProductRoute::Extract.as_str(),
-        payload.source.as_deref(),
-        None,
-    )
-    .await?;
+    let started = Instant::now();
+    let source = payload.source.clone();
+    let options = payload.provenance_options();
     let data = fetcher
         .product_fetch_with_auth(payload, ProductRoute::Extract, Some(&auth_context))
         .await?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "extract",
+        source.as_deref(),
+        None,
+        started,
+        options,
+    )
+    .await?;
     Ok(Json(data))
 }
 
@@ -181,17 +221,22 @@ pub async fn screenshot_post(
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Screenshot)?;
-    debit_product_route(
-        &credits,
-        &auth_context,
-        ProductRoute::Screenshot.as_str(),
-        payload.source.as_deref(),
-        None,
-    )
-    .await?;
+    let started = Instant::now();
+    let source = payload.source.clone();
+    let options = payload.provenance_options();
     let data = fetcher
         .product_fetch_with_auth(payload, ProductRoute::Screenshot, Some(&auth_context))
         .await?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "screenshot",
+        source.as_deref(),
+        None,
+        started,
+        options,
+    )
+    .await?;
     Ok(Json(data))
 }
 
@@ -202,15 +247,22 @@ pub async fn fetch_fast(
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<FetchWithReceipt>, FetchError> {
     validate_source_url(&payload.source)?;
+    let started = Instant::now();
+    let options = payload.provenance_options();
+    options.validate()?;
+    let data = fetcher
+        .get_fast_data_with_receipt_with_options(&payload.source, Some(&auth_context), options)
+        .await?;
     debit_product_route(
         &credits,
         &auth_context,
         "fetchfast",
         Some(&payload.source),
         None,
+        started,
+        options,
     )
     .await?;
-    let data = fetcher.get_fast_data_with_receipt(&payload.source).await?;
     Ok(Json(data))
 }
 
@@ -221,11 +273,21 @@ pub async fn get_receipt(
     Path(id): Path<String>,
 ) -> Result<Json<Receipt>, FetchError> {
     validate_receipt_id(&id)?;
-    debit_product_route(&credits, &auth_context, "receipt", None, Some(&id)).await?;
-    fetcher
+    let started = Instant::now();
+    let receipt = fetcher
         .get_receipt(&id)
-        .map(Json)
-        .ok_or_else(|| FetchError::NotFound(format!("Receipt not found: {id}")))
+        .ok_or_else(|| FetchError::NotFound(format!("Receipt not found: {id}")))?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "receipt",
+        None,
+        Some(&id),
+        started,
+        ProvenanceOptions::default(),
+    )
+    .await?;
+    Ok(Json(receipt))
 }
 
 pub async fn snapshot_source(
@@ -235,15 +297,22 @@ pub async fn snapshot_source(
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<crate::snapshot_upload::SnapshotPayload>, FetchError> {
     validate_source_url(&payload.source)?;
+    let started = Instant::now();
+    let options = payload.provenance_options();
+    options.validate()?;
+    let snapshot = fetcher
+        .snapshot_with_receipt_with_options(&payload.source, Some(&auth_context), options)
+        .await?;
     debit_product_route(
         &credits,
         &auth_context,
         "snapshot",
         Some(&payload.source),
         None,
+        started,
+        options,
     )
     .await?;
-    let snapshot = fetcher.snapshot_with_receipt(&payload.source).await?;
     Ok(Json(snapshot))
 }
 
@@ -255,15 +324,22 @@ pub async fn fetch_unblock(
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<Value>, FetchError> {
     validate_source_url(&payload.source)?;
+    let started = Instant::now();
+    let options = payload.provenance_options();
+    options.validate()?;
+    let data = fetcher
+        .unblocker_with_options(&payload.source, Some(&auth_context), options)
+        .await?;
     debit_product_route(
         &credits,
         &auth_context,
         "fetchunblock",
         Some(&payload.source),
         None,
+        started,
+        options,
     )
     .await?;
-    let data = fetcher.unblocker(&payload.source).await?;
     Ok(Json(data))
 }
 
@@ -273,9 +349,12 @@ async fn debit_product_route(
     route: &str,
     source_url: Option<&str>,
     subject_id: Option<&str>,
+    started: Instant,
+    options: ProvenanceOptions,
 ) -> Result<(), FetchError> {
+    let charge = credits.charge_for(route, started.elapsed(), options);
     match credits
-        .debit_product_request(auth_context, route, source_url, subject_id)
+        .debit_product_request(auth_context, route, source_url, subject_id, charge, options)
         .await
     {
         Ok(Some(outcome)) => {
@@ -290,6 +369,8 @@ async fn debit_product_route(
                     "source_sha256": source_url.map(crate::security::sensitive_hash),
                     "charged": outcome.charged,
                     "amount": outcome.amount,
+                    "elapsed_ms": charge.elapsed_ms,
+                    "credit_budget": charge.budget,
                     "mode": outcome.mode,
                     "enforced": outcome.enforced,
                 })

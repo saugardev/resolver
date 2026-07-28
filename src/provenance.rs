@@ -134,6 +134,24 @@ impl From<&ProvenanceRegistryRefResponse> for ProvenanceRegistryRef {
     }
 }
 
+fn publication_targets_ready(
+    record: &ProvenanceAttestationResponse,
+    require_arweave: bool,
+    require_registry: bool,
+) -> bool {
+    let arweave_ready = !require_arweave
+        || record
+            .registry_refs
+            .iter()
+            .any(|reference| reference.arweave_location.is_some());
+    let registry_ready = !require_registry
+        || record
+            .registry_refs
+            .iter()
+            .any(|reference| reference.transaction_hash.is_some());
+    arweave_ready && registry_ready
+}
+
 #[derive(Debug)]
 pub struct ResolverFetchEvidence<'a> {
     pub payload: &'a ProductRequest,
@@ -259,8 +277,9 @@ impl ProvenanceClient {
             "bytes": data_bytes,
         });
         let receipt_id = evidence.receipt.map(|receipt| receipt.id.clone());
-        let response_artifact_enabled =
-            self.config.managed_publication && self.config.publish_response_artifact;
+        let response_artifact_enabled = evidence.payload.publish_to_arweave == Some(true)
+            && self.config.managed_publication
+            && self.config.publish_response_artifact;
         let response_artifact = if artifact_fits_limit(
             response_artifact_enabled,
             response_bytes.len(),
@@ -348,8 +367,13 @@ impl ProvenanceClient {
                 "output_sha256": data_sha256,
                 "output_commitment_sha256": sha256_json_hex(&output_commitment)?,
                 "receipt_id": receipt_id,
+                "publication_options": {
+                    "publish_to_arweave": evidence.payload.publish_to_arweave == Some(true),
+                    "register_onchain": evidence.payload.register_onchain == Some(true),
+                    "wait_for_publication": evidence.payload.wait_for_publication == Some(true),
+                },
                 "response_artifact": {
-                    "enabled": self.config.publish_response_artifact,
+                    "enabled": response_artifact_enabled,
                     "included": response_artifact.is_some(),
                     "response_bytes": data_bytes,
                     "artifact_bytes": response_artifact.as_ref().map(Vec::len),
@@ -360,13 +384,28 @@ impl ProvenanceClient {
             )?,
         };
 
-        let publish = if self.config.managed_publication {
+        let publication_requested = evidence.payload.publish_to_arweave == Some(true)
+            || evidence.payload.register_onchain == Some(true);
+        if publication_requested && !self.config.managed_publication {
+            return Err(ProvenanceError::InvalidEnv(
+                "managed publication was requested but is disabled by the resolver".to_string(),
+            ));
+        }
+        if evidence.payload.publication_wait_requested() && !self.config.wait_for_registry_refs {
+            return Err(ProvenanceError::InvalidEnv(
+                "publication waiting was requested but is disabled by the resolver".to_string(),
+            ));
+        }
+
+        let publish = if publication_requested {
             Some(managed_publication_request(
                 &request.subject_id,
                 evidence.route,
                 evidence.mode,
                 receipt_id.as_deref(),
                 response_artifact.as_deref(),
+                evidence.payload.publish_to_arweave == Some(true),
+                evidence.payload.register_onchain == Some(true),
             ))
         } else {
             None
@@ -390,23 +429,34 @@ impl ProvenanceClient {
             }
         };
         let mut registry_ref_poll_error = None;
-        if self.config.managed_publication
-            && self.config.wait_for_registry_refs
-            && !used_oauth_passthrough
-        {
-            let api = self.legacy_api()?;
-            match api
-                .wait_for_registry_refs(
-                    &record.provenance_attestation_id,
-                    RegistryRefWaitOptions::new(
-                        self.config.registry_wait_attempts,
-                        Duration::from_millis(self.config.registry_wait_interval_ms),
-                    ),
-                )
-                .await
-            {
-                Ok(published) => record = published,
-                Err(err) => registry_ref_poll_error = Some(err.to_string()),
+        if publication_requested && evidence.payload.publication_wait_requested() {
+            if used_oauth_passthrough {
+                match self
+                    .wait_for_publication_with_http(
+                        &record.provenance_attestation_id,
+                        evidence.payload.publish_to_arweave == Some(true),
+                        evidence.payload.register_onchain == Some(true),
+                    )
+                    .await
+                {
+                    Ok(published) => record = published,
+                    Err(err) => registry_ref_poll_error = Some(err.to_string()),
+                }
+            } else {
+                let api = self.legacy_api()?;
+                match api
+                    .wait_for_registry_refs(
+                        &record.provenance_attestation_id,
+                        RegistryRefWaitOptions::new(
+                            self.config.registry_wait_attempts,
+                            Duration::from_millis(self.config.registry_wait_interval_ms),
+                        ),
+                    )
+                    .await
+                {
+                    Ok(published) => record = published,
+                    Err(err) => registry_ref_poll_error = Some(err.to_string()),
+                }
             }
         }
 
@@ -492,6 +542,38 @@ impl ProvenanceClient {
         }
 
         Ok(response.json().await?)
+    }
+
+    async fn wait_for_publication_with_http(
+        &self,
+        attestation_id: &str,
+        require_arweave: bool,
+        require_registry: bool,
+    ) -> Result<ProvenanceAttestationResponse, ProvenanceError> {
+        let endpoint = format!(
+            "{}/api/v1/public/provenance/attestations/{}",
+            self.config.backend_base_url, attestation_id
+        );
+        for attempt in 0..self.config.registry_wait_attempts {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(self.config.registry_wait_interval_ms))
+                    .await;
+            }
+            let response = self.http.get(&endpoint).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(ProvenanceError::Backend { status, body });
+            }
+            let record = response.json::<ProvenanceAttestationResponse>().await?;
+            if publication_targets_ready(&record, require_arweave, require_registry) {
+                return Ok(record);
+            }
+        }
+
+        Err(ProvenanceError::InvalidEnv(
+            "publication did not complete within the configured wait window".to_string(),
+        ))
     }
 
     fn request_body_with_integration<T>(&self, request: &T) -> Result<Value, ProvenanceError>
@@ -676,6 +758,8 @@ fn managed_publication_request(
     mode: ProductMode,
     receipt_id: Option<&str>,
     response_bytes: Option<&[u8]>,
+    publish_to_arweave: bool,
+    register_onchain: bool,
 ) -> ProvenanceManagedPublicationRequest {
     let mut request = ProvenanceManagedPublicationRequest::livy_managed_registry()
         .with_livy_explorer_id(subject_id)
@@ -687,6 +771,8 @@ fn managed_publication_request(
             "mode": mode_label(mode),
             "receipt_id": receipt_id,
         }));
+    request.arweave = publish_to_arweave;
+    request.registry = register_onchain;
     if let Some(response_bytes) = response_bytes {
         request = request.with_artifact(
             ProvenanceManagedPublicationArtifact::from_bytes(
@@ -839,6 +925,18 @@ pub(crate) fn request_summary(
         &payload.max_credits_per_page,
     );
     insert_serialized(&mut summary, "receipt", &payload.receipt);
+    insert_serialized(&mut summary, "provenance", &payload.provenance);
+    insert_serialized(
+        &mut summary,
+        "publish_to_arweave",
+        &payload.publish_to_arweave,
+    );
+    insert_serialized(&mut summary, "register_onchain", &payload.register_onchain);
+    insert_serialized(
+        &mut summary,
+        "wait_for_publication",
+        &payload.wait_for_publication,
+    );
     insert_serialized(&mut summary, "search_limit", &payload.search_limit);
     insert_serialized(
         &mut summary,
@@ -1253,6 +1351,8 @@ mod tests {
             ProductMode::Fast,
             Some("receipt-1"),
             Some(br#"{"ok":true}"#),
+            true,
+            true,
         );
         let value = serde_json::to_value(request).unwrap();
 
@@ -1284,6 +1384,35 @@ mod tests {
             sha256_bytes_hex(br#"{"ok":true}"#),
             sha256_json_hex(&json!({"ok": true})).unwrap()
         );
+    }
+
+    #[test]
+    fn managed_publication_targets_are_independently_selectable() {
+        let arweave_only = serde_json::to_value(managed_publication_request(
+            "resolver_fetch:arweave",
+            ProductRoute::Scrape,
+            ProductMode::Fast,
+            None,
+            None,
+            true,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(arweave_only["arweave"], true);
+        assert_eq!(arweave_only["registry"], false);
+
+        let registry_only = serde_json::to_value(managed_publication_request(
+            "resolver_fetch:registry",
+            ProductRoute::Scrape,
+            ProductMode::Fast,
+            None,
+            None,
+            false,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(registry_only["arweave"], false);
+        assert_eq!(registry_only["registry"], true);
     }
 
     #[test]
@@ -1330,6 +1459,8 @@ mod tests {
             ProductMode::Fast,
             Some("receipt-1"),
             None,
+            true,
+            true,
         );
         let value = serde_json::to_value(request).unwrap();
 

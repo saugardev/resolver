@@ -41,8 +41,9 @@ LIVY_RESOLVER_OAUTH_RESOURCE_METADATA_URL=https://resolver.api.livylabs.xyz/.wel
 
 ## Livy Provenance
 
-The resolver can store a Livy provenance attestation for every successful
-fetch. This branch records generic resolver source-fetch proofs with:
+The resolver can store a Livy provenance attestation for successful fetches
+that opt in per request. This branch records generic resolver source-fetch
+proofs with:
 
 - `attestation_claim=source`
 - `subject_type=resolver_fetch`
@@ -98,9 +99,9 @@ Set `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` only when the API key is
 allowed to write provenance templates. Public explorer reads also require
 the matching public template to exist in Livy.
 
-`LIVY_PROVENANCE_MANAGED_PUBLICATION=true` asks Livy backend to publish the
-provenance receipt and a versioned resolver request/response exchange to
-Arweave, then register the receipt on the configured EVM registry. The exchange
+`LIVY_PROVENANCE_MANAGED_PUBLICATION=true` allows Livy backend to publish a
+requested provenance receipt and versioned resolver request/response exchange
+to Arweave and/or register the receipt on the configured EVM registry. The exchange
 is named `resolver-response.json` and uses the `resolver-tool-exchange-v1`
 schema. Its top-level `request` contains the same sanitized request summary used
 for the input commitment, while `response` contains the exact upstream JSON.
@@ -117,6 +118,44 @@ still returns the attestation immediately. Set
 `LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=true` only when the caller should wait
 for public `registry_refs`; that mode requires the API key to have provenance
 read access in addition to write access.
+
+Each product request and MCP `fetch_source` call accepts these opt-ins:
+
+```json
+{
+  "provenance": true,
+  "publish_to_arweave": true,
+  "register_onchain": true,
+  "wait_for_publication": false
+}
+```
+
+Publication flags imply provenance. With `wait_for_publication=false`, Livy
+continues managed publication asynchronously after accepting the attestation.
+With it set to `true`, the resolver polls until the requested Arweave and/or
+registry references are available; the deployment must allow this with
+`LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=true`. Deployment settings remain
+capability gates, so a request cannot enable managed publication when it is
+disabled for the resolver.
+
+## Credit billing
+
+Successful calls are debited after their selected work is dispatched or,
+when publication waiting is requested, after the wait completes. The charge is
+one credit per started minute of resolver wall time, capped by the route budget:
+
+- 1 credit for fetch, map, search, extract, receipt, and MCP fast fetch.
+- 3 credits for screenshot, unblock, and snapshot.
+- 5 credits for crawl or any request selecting managed publication.
+
+Configure the conversion and caps with:
+
+```dotenv
+LIVY_RESOLVER_CREDIT_MS_PER_CREDIT=60000
+LIVY_RESOLVER_BASE_CREDIT_BUDGET=1
+LIVY_RESOLVER_ENHANCED_CREDIT_BUDGET=3
+LIVY_RESOLVER_PUBLICATION_CREDIT_BUDGET=5
+```
 
 ## HTTP API
 

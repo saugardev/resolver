@@ -112,6 +112,31 @@ pub enum ProductProxy {
     Mobile,
 }
 
+/// Per-call provenance and managed-publication choices.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProvenanceOptions {
+    pub provenance: bool,
+    pub publish_to_arweave: bool,
+    pub register_onchain: bool,
+    pub wait_for_publication: bool,
+}
+
+impl ProvenanceOptions {
+    pub fn normalized(mut self) -> Self {
+        self.provenance |= self.publish_to_arweave || self.register_onchain;
+        self
+    }
+
+    pub fn validate(self) -> Result<(), crate::errors::FetchError> {
+        if self.wait_for_publication && !self.publish_to_arweave && !self.register_onchain {
+            return Err(crate::errors::FetchError::BadRequest(
+                "`wait_for_publication` requires `publish_to_arweave` or `register_onchain`".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Product API request accepted by route handlers.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProductRequest {
@@ -200,6 +225,14 @@ pub struct ProductRequest {
     pub max_credits_per_page: Option<f64>,
     /// Whether to create an in-memory receipt.
     pub receipt: Option<bool>,
+    /// Create a Livy provenance attestation for this request.
+    pub provenance: Option<bool>,
+    /// Publish the resolver artifact to Arweave. Implies `provenance`.
+    pub publish_to_arweave: Option<bool>,
+    /// Register the attestation on the configured on-chain registry. Implies `provenance`.
+    pub register_onchain: Option<bool>,
+    /// Wait for requested publication targets before returning.
+    pub wait_for_publication: Option<bool>,
     /// Number of search results to request.
     pub search_limit: Option<u32>,
     /// Fetch content for search results.
@@ -232,6 +265,7 @@ impl ProductRequest {
             60,
         )?;
         validate_range("crawl_timeout_secs", self.crawl_timeout_secs, 1, 60)?;
+        self.provenance_options().validate()?;
         validate_range("wait_ms", self.wait_ms, 0, 30_000)?;
         validate_range("scroll", self.scroll.map(u64::from), 0, 100)?;
 
@@ -324,6 +358,10 @@ impl ProductRequest {
             lite_mode: None,
             max_credits_per_page: None,
             receipt: Some(false),
+            provenance: None,
+            publish_to_arweave: None,
+            register_onchain: None,
+            wait_for_publication: None,
             search_limit: None,
             fetch_page_content: None,
             quick_search: None,
@@ -346,6 +384,35 @@ impl ProductRequest {
         self.source
             .as_deref()
             .ok_or_else(|| crate::errors::FetchError::BadRequest("route requires `source`".into()))
+    }
+
+    /// Whether this request opts into provenance or one of its publication targets.
+    pub fn provenance_requested(&self) -> bool {
+        self.provenance_options().provenance
+    }
+
+    /// Whether this request asks the resolver to wait for publication completion.
+    pub fn publication_wait_requested(&self) -> bool {
+        self.wait_for_publication == Some(true)
+    }
+
+    pub fn provenance_options(&self) -> ProvenanceOptions {
+        ProvenanceOptions {
+            provenance: self.provenance == Some(true),
+            publish_to_arweave: self.publish_to_arweave == Some(true),
+            register_onchain: self.register_onchain == Some(true),
+            wait_for_publication: self.wait_for_publication == Some(true),
+        }
+        .normalized()
+    }
+
+    /// Apply tool-level provenance options to a product request.
+    pub fn apply_provenance_options(&mut self, options: ProvenanceOptions) {
+        let options = options.normalized();
+        self.provenance = Some(options.provenance);
+        self.publish_to_arweave = Some(options.publish_to_arweave);
+        self.register_onchain = Some(options.register_onchain);
+        self.wait_for_publication = Some(options.wait_for_publication);
     }
 }
 
@@ -680,6 +747,17 @@ mod tests {
             ..ProductRequest::legacy("https://example.com")
         };
         assert!(search.validate_for(ProductRoute::Search).is_ok());
+    }
+
+    #[test]
+    fn publication_wait_requires_at_least_one_publication_target() {
+        let mut request = ProductRequest::legacy("https://example.com");
+        request.wait_for_publication = Some(true);
+        assert!(request.validate_for(ProductRoute::Scrape).is_err());
+
+        request.publish_to_arweave = Some(true);
+        assert!(request.validate_for(ProductRoute::Scrape).is_ok());
+        assert!(request.provenance_requested());
     }
 
     #[test]

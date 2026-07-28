@@ -4,7 +4,7 @@ use crate::auth::{ResolverAuth, ResolverAuthContext};
 use crate::credits::ResolverCreditsClient;
 use crate::errors::ResolverAuthError;
 use crate::fetch::Fetcher;
-use crate::types::FetchWithReceipt;
+use crate::types::{FetchWithReceipt, ProvenanceOptions};
 use crate::types::{validate_idempotency_key, validate_source_url};
 use axum::{
     Json,
@@ -48,6 +48,16 @@ pub struct Params {
         description = "Optional stable idempotency key for this fetch_source call. Reuse the same key only when retrying the same MCP call."
     )]
     pub idempotency_key: Option<String>,
+    #[schemars(description = "Create a Livy provenance attestation for this fetch.")]
+    pub provenance: Option<bool>,
+    #[schemars(description = "Publish the resolver artifact to Arweave. Implies provenance.")]
+    pub publish_to_arweave: Option<bool>,
+    #[schemars(
+        description = "Register the attestation on the configured on-chain registry. Implies provenance."
+    )]
+    pub register_onchain: Option<bool>,
+    #[schemars(description = "Wait for requested publication targets before returning.")]
+    pub wait_for_publication: Option<bool>,
 }
 
 pub struct Server {
@@ -162,6 +172,10 @@ impl Server {
         Parameters(Params {
             url,
             idempotency_key,
+            provenance,
+            publish_to_arweave,
+            register_onchain,
+            wait_for_publication,
         }): Parameters<Params>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth_context = match self.require_oauth(&parts).await? {
@@ -169,8 +183,16 @@ impl Server {
             Err(result) => return Ok(result),
         };
 
+        let provenance_options = ProvenanceOptions {
+            provenance: provenance.unwrap_or(false),
+            publish_to_arweave: publish_to_arweave.unwrap_or(false),
+            register_onchain: register_onchain.unwrap_or(false),
+            wait_for_publication: wait_for_publication.unwrap_or(false),
+        }
+        .normalized();
         if let Err(err) = validate_source_url(&url)
             .and_then(|_| validate_idempotency_key(idempotency_key.as_deref()))
+            .and_then(|_| provenance_options.validate())
         {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Invalid fetch_source request: {}",
@@ -178,7 +200,6 @@ impl Server {
             ))]));
         }
 
-        // Keep every fetch path, including cached unblock fallback, behind auth and credit debit.
         let started = Instant::now();
         let source_sha256 = crate::security::sensitive_hash(&url);
         eprintln!(
@@ -191,55 +212,6 @@ impl Server {
                 "source_sha256": &source_sha256,
             })
         );
-        match self
-            .credits
-            .debit_fetch_source(&auth_context, &url, idempotency_key.as_deref())
-            .await
-        {
-            Ok(Some(outcome)) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "mcp_credit_debit",
-                        "request_id": crate::security::current_request_id(),
-                        "source_sha256": &source_sha256,
-                        "charged": outcome.charged,
-                        "amount": outcome.amount,
-                        "mode": outcome.mode,
-                        "enforced": outcome.enforced,
-                    })
-                );
-            }
-            Ok(None) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "mcp_credit_debit_skipped",
-                        "request_id": crate::security::current_request_id(),
-                        "source_sha256": &source_sha256,
-                    })
-                );
-            }
-            Err(err) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "mcp_credit_debit_failed",
-                        "request_id": crate::security::current_request_id(),
-                        "source_sha256": &source_sha256,
-                        "elapsed_ms": started.elapsed().as_millis(),
-                        "payment_required": err.is_payment_required(),
-                    })
-                );
-                let message = if err.is_payment_required() {
-                    "Livy payment required".to_string()
-                } else {
-                    "Livy credit authorization service is unavailable".to_string()
-                };
-                return Ok(CallToolResult::error(vec![Content::text(message)]));
-            }
-        }
-
         let cache_key = normalize_fallback_url_key(&url);
         let fallback_reason = self.fallback_cache.lookup(&cache_key);
         let data = if let Some(reason) = fallback_reason {
@@ -254,7 +226,11 @@ impl Server {
                 })
             );
             self.fetcher
-                .get_unblock_data_with_receipt_with_auth(&url, Some(&auth_context))
+                .get_unblock_data_with_receipt_with_options(
+                    &url,
+                    Some(&auth_context),
+                    provenance_options,
+                )
                 .await
                 .map_err(|_| {
                     eprintln!(
@@ -272,7 +248,11 @@ impl Server {
         } else {
             match self
                 .fetcher
-                .get_fast_data_with_receipt_with_auth(&url, Some(&auth_context))
+                .get_fast_data_with_receipt_with_options(
+                    &url,
+                    Some(&auth_context),
+                    provenance_options,
+                )
                 .await
             {
                 Ok(data) => {
@@ -303,6 +283,74 @@ impl Server {
                 }
             }
         };
+
+        let billing_route = if fallback_reason.is_some() {
+            "fetchunblock"
+        } else {
+            "mcp.fetch_source"
+        };
+        let charge = self
+            .credits
+            .charge_for(billing_route, started.elapsed(), provenance_options);
+        match self
+            .credits
+            .debit_fetch_source(
+                &auth_context,
+                &url,
+                idempotency_key.as_deref(),
+                charge,
+                provenance_options,
+            )
+            .await
+        {
+            Ok(Some(outcome)) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "charged": outcome.charged,
+                        "amount": outcome.amount,
+                        "mode": outcome.mode,
+                        "enforced": outcome.enforced,
+                        "elapsed_ms": charge.elapsed_ms,
+                        "credit_budget": charge.budget,
+                    })
+                );
+            }
+            Ok(None) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit_skipped",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "elapsed_ms": charge.elapsed_ms,
+                        "computed_amount": charge.amount,
+                    })
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit_failed",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "elapsed_ms": charge.elapsed_ms,
+                        "computed_amount": charge.amount,
+                        "payment_required": err.is_payment_required(),
+                    })
+                );
+                let message = if err.is_payment_required() {
+                    "Livy payment required".to_string()
+                } else {
+                    "Livy credit settlement service is unavailable".to_string()
+                };
+                return Ok(CallToolResult::error(vec![Content::text(message)]));
+            }
+        }
 
         let text = render_fetch_result(&data);
         eprintln!(
@@ -717,6 +765,14 @@ fn fetch_source_output_schema() -> Value {
                 "type": "integer",
                 "description": "Extracted content size in bytes when available."
             },
+            "provenance": {
+                "type": "object",
+                "description": "Livy provenance attestation and publication status when requested."
+            },
+            "provenance_error": {
+                "type": "string",
+                "description": "Non-fatal provenance or publication error when requested work failed."
+            },
             "text": {
                 "type": "string",
                 "description": "Fetched source text or serialized upstream payload."
@@ -750,6 +806,12 @@ fn structured_fetch_result(data: &FetchWithReceipt) -> Value {
     if let Some(content_bytes) = receipt.content_bytes {
         result.insert("content_bytes".to_string(), json!(content_bytes));
     }
+    if let Some(provenance) = &data.provenance {
+        result.insert("provenance".to_string(), json!(provenance));
+    }
+    if let Some(error) = &data.provenance_error {
+        result.insert("provenance_error".to_string(), json!(error));
+    }
     result.insert(
         "text".to_string(),
         json!(
@@ -779,6 +841,19 @@ fn render_fetch_result(data: &FetchWithReceipt) -> String {
         "content_bytes: {}",
         display_option(receipt.content_bytes)
     );
+    if let Some(provenance) = &data.provenance {
+        let _ = writeln!(
+            output,
+            "provenance_attestation_id: {}",
+            provenance.provenance_attestation_id
+        );
+        if let Some(explorer) = &provenance.explorer_url {
+            let _ = writeln!(output, "provenance_explorer: {explorer}");
+        }
+    }
+    if let Some(error) = &data.provenance_error {
+        let _ = writeln!(output, "provenance_error: {error}");
+    }
     output.push_str("\n---\n\n");
     match extracted_content(&data.data) {
         Some(content) => output.push_str(content),
