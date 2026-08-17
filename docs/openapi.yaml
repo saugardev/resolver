@@ -1,0 +1,837 @@
+openapi: 3.1.0
+info:
+  title: Livy Resolver API
+  version: 0.1.0
+  description: |
+    OAuth-protected source resolution. Unknown JSON fields are rejected. A
+    successful upstream response is captured for credits before a receipt or
+    provenance record is finalized.
+servers:
+  - url: http://localhost:3001
+    description: Local development
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      operationId: getLiveness
+      summary: Process liveness
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status:
+                    const: alive
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Traffic readiness and dependency health
+      security: []
+      responses:
+        "200":
+          description: Ready to accept source work
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+        "503":
+          description: Draining or a required dependency is unavailable
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Readiness"
+                  - $ref: "#/components/schemas/Error"
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Low-cardinality Prometheus process metrics
+      description: Restrict this endpoint to the private metrics network at the gateway.
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+  /.well-known/oauth-protected-resource:
+    get:
+      operationId: getOAuthProtectedResourceMetadata
+      summary: OAuth protected-resource discovery metadata
+      security: []
+      responses:
+        "200":
+          description: Resolver OAuth resource metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthProtectedResource"
+  /.well-known/oauth-protected-resource/mcp:
+    get:
+      operationId: getMcpOAuthProtectedResourceMetadata
+      summary: MCP-compatible OAuth protected-resource discovery metadata
+      security: []
+      responses:
+        "200":
+          description: Resolver OAuth resource metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OAuthProtectedResource"
+  /fetch:
+    post:
+      operationId: fetchSource
+      summary: Fetch one source
+      description: Mode must be auto, fast, browser, unblock, or raw.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/SourceProductRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/ProductSuccess"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/PaymentRequired"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "502":
+          $ref: "#/components/responses/UpstreamFailure"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+  /crawl:
+    post:
+      operationId: crawlSource
+      summary: Crawl a source site
+      description: Mode must be auto or crawl.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/SourceProductRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/ProductSuccess"
+        default:
+          $ref: "#/components/responses/Error"
+  /map:
+    post:
+      operationId: mapSource
+      summary: Discover source links
+      description: Mode must be auto or map.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/SourceProductRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/ProductSuccess"
+        default:
+          $ref: "#/components/responses/Error"
+  /search:
+    post:
+      operationId: searchSources
+      summary: Search the web
+      description: Query is required and mode must be auto or search.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ProductRequest"
+                - oneOf:
+                    - type: object
+                      required: [query]
+                      not:
+                        required: [q]
+                    - type: object
+                      required: [q]
+                      not:
+                        required: [query]
+      responses:
+        "200":
+          $ref: "#/components/responses/ProductSuccess"
+        default:
+          $ref: "#/components/responses/Error"
+  /extract:
+    post:
+      operationId: extractSource
+      summary: Fetch source content for structured extraction
+      description: Mode must be auto or extract.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/SourceProductRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/ProductSuccess"
+        default:
+          $ref: "#/components/responses/Error"
+  /screenshot:
+    post:
+      operationId: screenshotSource
+      summary: Capture a source screenshot
+      description: Mode must be auto or screenshot.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/SourceProductRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/ProductSuccess"
+        default:
+          $ref: "#/components/responses/Error"
+  /snapshot:
+    post:
+      operationId: snapshotSource
+      summary: Capture raw HTML and a screenshot under one receipt
+      description: The resolver constructs the bounded screenshot/raw snapshot mode.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/CompatibilityRequest"
+      responses:
+        "200":
+          description: Snapshot payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotPayload"
+        default:
+          $ref: "#/components/responses/Error"
+  /fetchfast:
+    post:
+      operationId: fetchSourceFastCompatibility
+      deprecated: true
+      summary: Compatibility fast fetch
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/CompatibilityRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/FetchWithReceiptSuccess"
+        default:
+          $ref: "#/components/responses/Error"
+  /fetchunblock:
+    post:
+      operationId: fetchSourceUnblockCompatibility
+      deprecated: true
+      summary: Compatibility unblock fetch
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        $ref: "#/components/requestBodies/CompatibilityRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/FetchWithReceiptSuccess"
+        default:
+          $ref: "#/components/responses/Error"
+  /receipt/{id}:
+    get:
+      operationId: getReceipt
+      summary: Read a receipt owned by the authenticated tenant and project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]{1,128}$"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Tenant-owned receipt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Receipt"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+  /:
+    post:
+      operationId: streamableHttpMcpRootCompatibility
+      deprecated: true
+      summary: Compatibility alias for the stateless MCP JSON-RPC endpoint
+      description: Prefer `/mcp`; the request and response contract is identical.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: MCP JSON-RPC response
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /mcp:
+    post:
+      operationId: streamableHttpMcp
+      summary: Stateless MCP JSON-RPC endpoint
+      description: |
+        Implements MCP Streamable HTTP. Tool `fetch_source` accepts only `url`,
+        optional `idempotency_key`, `publish_provenance`, and
+        `reveal_provenance_response`; unknown fields are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: MCP JSON-RPC response
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: OAuth2 access token
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Stable retry key, scoped to the authenticated caller and exact request.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_.:-]+$"
+  requestBodies:
+    SourceProductRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/ProductRequest"
+              - oneOf:
+                  - type: object
+                    required: [source]
+                    not:
+                      required: [url]
+                  - type: object
+                    required: [url]
+                    not:
+                      required: [source]
+    CompatibilityRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CompatibilityRequest"
+  responses:
+    ProductSuccess:
+      description: Validated and finalized resolver result
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ProductResponse"
+    FetchWithReceiptSuccess:
+      description: Compatibility result with a required resolver receipt
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/FetchWithReceipt"
+    Error:
+      description: Request failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Invalid JSON or request contract
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid OAuth token
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PaymentRequired:
+      description: Insufficient credits
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Idempotency key conflict or non-replayable finalized request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Receipt not found in the authenticated tenant/project scope
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UpstreamFailure:
+      description: Spider rejected, redirected, or returned an invalid result
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unavailable:
+      description: OAuth, credits, receipt storage, or egress capability is unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Timeout:
+      description: Resolver deadline expired
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    ProductRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        source:
+          type: string
+          format: uri
+          maxLength: 8192
+          description: Preferred exact source field; `url` is a legacy alias.
+        url:
+          type: string
+          format: uri
+          maxLength: 8192
+          deprecated: true
+        query:
+          type: string
+          maxLength: 2048
+          description: Preferred search field; `q` is a legacy alias.
+        q:
+          type: string
+          maxLength: 2048
+          deprecated: true
+        mode:
+          $ref: "#/components/schemas/ProductMode"
+        format:
+          oneOf:
+            - $ref: "#/components/schemas/ProductFormat"
+            - type: array
+              minItems: 1
+              maxItems: 8
+              items:
+                $ref: "#/components/schemas/ProductFormat"
+        formats:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            $ref: "#/components/schemas/ProductFormat"
+        proxy:
+          type: string
+          enum: [auto, none, isp, residential, mobile]
+        proxy_enabled:
+          type: boolean
+          deprecated: true
+          description: Always rejected; use `proxy`.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        depth:
+          type: integer
+          minimum: 0
+          maximum: 10
+        timeout_secs:
+          type: integer
+          minimum: 1
+          maximum: 60
+        request_timeout_secs:
+          type: integer
+          minimum: 1
+          maximum: 60
+        crawl_timeout_secs:
+          type: integer
+          minimum: 1
+          maximum: 60
+        readability:
+          type: boolean
+        cache:
+          type: boolean
+        metadata:
+          type: boolean
+        return_headers:
+          type: boolean
+        return_page_links:
+          type: boolean
+        return_cookies:
+          type: boolean
+        country_code:
+          type: string
+          pattern: "^[A-Za-z]{2}$"
+        locale:
+          type: string
+          maxLength: 64
+        user_agent:
+          type: string
+          maxLength: 512
+        headers:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            type: string
+        cookies:
+          type: string
+          maxLength: 8192
+        root_selector:
+          type: string
+          maxLength: 1024
+        selectors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        whitelist:
+          $ref: "#/components/schemas/StringList"
+        blacklist:
+          $ref: "#/components/schemas/StringList"
+        tld:
+          type: boolean
+        subdomains:
+          type: boolean
+        external_domains:
+          $ref: "#/components/schemas/StringList"
+        sitemap:
+          type: boolean
+        respect_robots:
+          type: boolean
+        stealth:
+          type: boolean
+        fingerprint:
+          type: boolean
+        scroll:
+          type: integer
+          minimum: 0
+          maximum: 100
+        wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 30000
+        wait_selector:
+          type: string
+          maxLength: 1024
+        disable_intercept:
+          type: boolean
+        disable_hints:
+          type: boolean
+        lite_mode:
+          type: boolean
+        max_credits_per_page:
+          type: number
+          exclusiveMinimum: 0
+        receipt:
+          type: boolean
+        provenance:
+          $ref: "#/components/schemas/ProvenanceConsent"
+        search_limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        fetch_page_content:
+          type: boolean
+        quick_search:
+          type: boolean
+        engine:
+          type: string
+          enum: [google, brave, all]
+    ProductMode:
+      type: string
+      default: auto
+      enum: [auto, smart, smart_mode, fast, browser, unblock, raw, crawl, map, search, extract, screenshot]
+    ProductFormat:
+      type: string
+      enum: [raw, markdown, commonmark, html2text, text, screenshot, xml, bytes]
+    StringList:
+      type: array
+      maxItems: 100
+      items:
+        type: string
+        maxLength: 2048
+    ProvenanceConsent:
+      type: object
+      additionalProperties: false
+      properties:
+        publish:
+          type: boolean
+          default: false
+        reveal_response:
+          type: boolean
+          default: false
+    CompatibilityRequest:
+      type: object
+      additionalProperties: false
+      required: [source]
+      properties:
+        source:
+          type: string
+          format: uri
+          maxLength: 8192
+        provenance:
+          $ref: "#/components/schemas/ProvenanceConsent"
+    ProductResponse:
+      type: object
+      additionalProperties: false
+      required: [route, mode, receipt_id, receipt, data]
+      properties:
+        route:
+          type: string
+        mode:
+          $ref: "#/components/schemas/ProductMode"
+        receipt_id:
+          type: [string, "null"]
+        receipt:
+          oneOf:
+            - $ref: "#/components/schemas/Receipt"
+            - type: "null"
+        data: {}
+        provenance:
+          $ref: "#/components/schemas/ProvenanceResult"
+        provenance_error:
+          type: string
+    FetchWithReceipt:
+      type: object
+      additionalProperties: false
+      required: [receipt_id, receipt, data]
+      properties:
+        receipt_id:
+          type: string
+        receipt:
+          $ref: "#/components/schemas/Receipt"
+        data: {}
+        provenance:
+          $ref: "#/components/schemas/ProvenanceResult"
+        provenance_error:
+          type: string
+    Receipt:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - source_url
+        - mode
+        - request_type
+        - proxy
+        - status
+        - error
+        - duration_elapsed_ms
+        - content_bytes
+        - total_cost
+        - created_at_unix_ms
+      properties:
+        id:
+          type: string
+        source_url:
+          type: string
+        mode:
+          type: string
+        request_type:
+          type: string
+        proxy:
+          type: [string, "null"]
+        status:
+          type: [integer, "null"]
+        error:
+          type: [string, "null"]
+        duration_elapsed_ms:
+          type: [integer, "null"]
+        content_bytes:
+          type: [integer, "null"]
+        total_cost:
+          type: [string, "null"]
+        created_at_unix_ms:
+          type: integer
+          minimum: 0
+    ProvenanceResult:
+      type: object
+      additionalProperties: false
+      required:
+        - provenance_attestation_id
+        - subject_id
+        - schema_id
+        - schema_version
+        - verification_status
+        - schema_binding_status
+        - public_values_commitment
+        - report_payload_hash
+        - data_sha256
+      properties:
+        provenance_attestation_id:
+          type: string
+        subject_id:
+          type: string
+        schema_id:
+          type: string
+        schema_version:
+          type: string
+        verification_status:
+          type: string
+        schema_binding_status:
+          type: string
+        public_values_commitment:
+          type: string
+        report_payload_hash:
+          type: string
+        explorer_url:
+          type: string
+          format: uri
+        managed_publication: {}
+        registry_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProvenanceRegistryRef"
+        registry_ref_poll_error:
+          type: string
+        data_sha256:
+          type: string
+    ProvenanceRegistryRef:
+      type: object
+      additionalProperties: false
+      required: [registry_kind, provider, chain_family, status, explorer_links]
+      properties:
+        registry_kind:
+          type: string
+        provider:
+          type: string
+        chain_family:
+          type: string
+        chain_id:
+          type: string
+        network:
+          type: string
+        registry_name:
+          type: string
+        registry_address:
+          type: string
+        transaction_hash:
+          type: string
+        block_number:
+          type: integer
+          minimum: 0
+        attestation_key:
+          type: string
+        arweave_location:
+          type: string
+        status:
+          type: string
+        explorer_links: {}
+        registered_at:
+          type: string
+    SnapshotPayload:
+      type: object
+      additionalProperties: false
+      required: [source_url, receipt_id, html, screenshot_base64]
+      properties:
+        source_url:
+          type: string
+        receipt_id:
+          type: string
+        html:
+          type: string
+        screenshot_base64:
+          type: string
+          contentEncoding: base64
+        provenance:
+          $ref: "#/components/schemas/ProvenanceResult"
+        provenance_error:
+          type: string
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        request_id:
+          type: [string, "null"]
+    Readiness:
+      type: object
+      additionalProperties: false
+      required: [status, dependencies, actual_fetch_egress, accepting_requests]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        dependencies:
+          type: string
+          enum: [ready, unavailable]
+        actual_fetch_egress:
+          type: string
+          enum: [ready, unavailable]
+        accepting_requests:
+          type: boolean
+    OAuthProtectedResource:
+      type: object
+      additionalProperties: false
+      required:
+        - resource
+        - resource_name
+        - authorization_servers
+        - introspection_endpoint
+        - scopes_supported
+        - bearer_methods_supported
+      properties:
+        resource:
+          type: string
+          format: uri
+        resource_name:
+          const: Livy Resolver
+        authorization_servers:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uri
+        introspection_endpoint:
+          type: string
+          format: uri
+        scopes_supported:
+          type: array
+          items:
+            type: string
+        bearer_methods_supported:
+          type: array
+          const: [header]

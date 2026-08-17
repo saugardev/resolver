@@ -1,21 +1,30 @@
 # Livy Web Resolver
 
-Default mode is SmartMode. Override via `mode` when you need specific cost/speed/browser/unblock behavior.
+Default mode is SmartMode. Override via `mode` when you need specific
+cost/speed/browser/unblock behavior.
 
-## Status
+This repository now has reproducible build and security gates, but it is not
+approved for public distribution or multi-replica production until the tracked
+[`release blockers`](docs/release-blockers.md) are closed.
 
-- [x] Browserful query and browserless URL resolver
-- [x] Sanitized markdown and request params
-- [x] Proxy enabling for complex requests
-- [ ] Residential proxy rotations
-- [ ] Prompt-based interaction with results
-- [x] MCP auth
-- [ ] Obscura headless (research)
+## Capabilities
+
+- Browser and browserless URL resolution through bounded Spider operations
+- Strict product request validation and adaptive in-request fallback
+- OAuth-protected HTTP and stateless MCP surfaces
+- Tenant-scoped receipts, credit capture, and optional private provenance
+- Fail-closed source egress policy, readiness, graceful drain, and metrics
 
 ## Setup
 
-```
+```dotenv
 LIVY_RESOLVER_KEY=your-resolver-key
+LIVY_RESOLVER_AUTH_ENABLED=false
+LIVY_RESOLVER_CREDITS_ENABLED=false
+LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true
+```
+
+```bash
 cargo run
 ```
 
@@ -25,6 +34,18 @@ The service listens on `http://localhost:3001` unless `PORT` or
 `RESOLVER_PORT` is set.
 
 Copy `.env.example` to `.env` for the full local configuration template.
+Its fail-closed default rejects the in-memory receipt store; set
+`LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true` only for a local or single-replica
+staging process. A source fetch also remains unready until the actual Spider
+egress capability documented under API security is configured.
+The exact Rust 1.94.0 toolchain is selected by `rust-toolchain.toml`. A sibling
+`livy-core` checkout is neither required nor read; the small provenance HTTP
+boundary is owned by this repository.
+
+The exact HTTP schema is [`docs/openapi.yaml`](docs/openapi.yaml). See the
+[`operations runbook`](docs/operations.md),
+[`dependency policy`](docs/dependency-policy.md), and
+[`MCP client example`](docs/mcp-client.example.json) before deployment.
 
 Product routes and MCP requests require a Livy OAuth bearer token by default.
 Unauthenticated MCP requests, including `initialize` and `tools/list`, return
@@ -97,12 +118,16 @@ LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES=262144
 LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=false
 LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS=30
 LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS=2000
+LIVY_PROVENANCE_TIMEOUT_SECS=10
 ```
 
 `LIVY_PROVENANCE_ENABLED=true` is the only setting that activates provenance;
 shared backend URLs and service credentials never activate it implicitly.
 `LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local
-or staging backends.
+or staging backends. It may contain a reverse-proxy deployment prefix such as
+`https://example.test/livy`, which is preserved when the resolver appends its
+fixed endpoint paths. Do not include `/api/v1`, credentials, a query, or a
+fragment in the base URL.
 
 The current Livy backend accepts only `resolver-fetch-v1@1`; the resolver
 fails startup on any other configured schema instead of making incompatible
@@ -230,6 +255,12 @@ capture without a caller key remain residual limitations.
 | POST | `/fetchfast` | Compat: fast fetch |
 | POST | `/fetchunblock` | Compat: unblock fetch |
 | GET | `/receipt/{id}` | Read receipt |
+| GET | `/healthz` | Process liveness |
+| GET | `/readyz` | Dependency and drain readiness |
+| GET | `/metrics` | Private-network Prometheus process metrics |
+| GET | `/.well-known/oauth-protected-resource[/mcp]` | OAuth resource metadata |
+| POST | `/mcp` | Preferred stateless MCP JSON-RPC endpoint |
+| POST | `/` | Deprecated compatibility alias for `/mcp` |
 
 Prefer `/fetch` with `mode` over the compat routes.
 
@@ -365,7 +396,7 @@ Rate limiting is intentionally gateway-managed so limits remain consistent
 across replicas. Apply burst limits by client IP or token hash at the ingress;
 credit debits continue to provide tenant-level economic enforcement.
 
-For operations, collect stdout with OpenTelemetry Collector, Vector, or Fluent
+For operations, collect stderr with OpenTelemetry Collector, Vector, or Fluent
 Bit. Prometheus and Grafana are suitable for request and gateway metrics, and
 Sentry can aggregate Rust failures. Alert on 5xx rates, upstream latency and
 timeouts, OAuth introspection failures, credit-service failures, validation
@@ -375,7 +406,7 @@ rejections, and gateway 429 responses. Do not attach raw source URLs as labels.
 
 - Endpoint: `/mcp`
 - Protected resource metadata: `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`, including `resource_name` and the Livy OAuth introspection endpoint
-- Server: `livygensyn-source-fetcher`
+- Server: `livy-resolver`
 - Tool: `fetch_source` — input `{ "url": "...", "publish_provenance": false, "reveal_provenance_response": false }`
 - Side effects: the descriptor truthfully marks the tool non-read-only and destructive because successful calls debit credits and store a tenant receipt; enabled provenance may create a private attestation, while public publication/reveal occurs only with authenticated explicit consent and deployment capability
 - Output: successful calls include both `receipt_id` and `explorer`, where `explorer` is `https://explorer.livylabs.xyz/?q=<receipt_id>` with the actual receipt id substituted
@@ -395,3 +426,13 @@ curl -s http://localhost:3001/fetch \
   -H "authorization: Bearer $LIVY_OAUTH_ACCESS_TOKEN" \
   -d '{"source":"https://example.com","mode":"fast","receipt":true}'
 ```
+
+For a complete local gate, install the pinned tools listed in CI and run the
+commands in [`CONTRIBUTING.md`](CONTRIBUTING.md). `scripts/smoke.sh` starts the
+real binary, verifies liveness, fail-closed readiness, strict JSON rejection,
+metrics, and SIGTERM drain. `scripts/verify-fresh-checkout.sh` proves that an
+archived checkout builds and tests without a sibling dependency.
+
+No repository license has been selected. This is a release blocker, and no
+license field is claimed in Cargo metadata; see
+[`docs/release-blockers.md`](docs/release-blockers.md).

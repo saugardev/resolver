@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.superstack
+target
+audit-report-*.html
+Dockerfile*
+docs/*.local.md

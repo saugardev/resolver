@@ -26,36 +26,17 @@ The resolver requires:
 LIVY_RESOLVER_KEY=your-resolver-key
 ```
 
-This repo does not include an MCP config file yet. The code loads `.env`
-and then reads `LIVY_RESOLVER_KEY` from the resolver process environment at
-startup. `SPIDER_API_KEY`, `SPIDER_KEY`, and `LIVY_KEY` are accepted as legacy
-aliases.
+An HTTP client example is checked in at `docs/mcp-client.example.json`. The code
+loads `.env` and then reads `LIVY_RESOLVER_KEY` from the resolver process
+environment at startup. `SPIDER_API_KEY`, `SPIDER_KEY`, and `LIVY_KEY` are
+accepted as legacy aliases.
 
-Configure the key based on how MCP is wired:
-
-- If the MCP config launches this repo, put `LIVY_RESOLVER_KEY` in that
-  server entry's `env`.
-- If the MCP client connects to an already-running
-  `http://localhost:3001/mcp`, configure `LIVY_RESOLVER_KEY` where that
-  server process is started.
-- For local manual runs, use a shell env var or local `.env`.
-
-Example launch config:
-
-```json
-{
-  "mcpServers": {
-    "livy-resolver": {
-      "command": "cargo",
-      "args": ["run"],
-      "cwd": "/path/to/resolver",
-      "env": {
-        "LIVY_RESOLVER_KEY": "your-resolver-key"
-      }
-    }
-  }
-}
-```
+Configure `LIVY_RESOLVER_KEY` in the environment of the separately running
+resolver process, not in an MCP client file. The checked-in client example uses
+Streamable HTTP at `http://localhost:3001/mcp`; it does not launch a stdio
+server. OAuth-capable clients discover authorization from the resolver's
+protected-resource metadata. For local manual runs, use a shell environment or
+an uncommitted `.env`.
 
 ## Livy Provenance
 
@@ -103,7 +84,15 @@ LIVY_PROVENANCE_MANAGED_PUBLICATION=false
 LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false
 LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=false
 LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES=262144
+LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=false
+LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS=30
+LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS=2000
+LIVY_PROVENANCE_TIMEOUT_SECS=10
 ```
+
+`LIVY_BACKEND_BASE_URL` may be an origin or a reverse-proxy deployment prefix;
+the resolver preserves that prefix and appends its fixed endpoints. Do not put
+`/api/v1`, credentials, a query, or a fragment in this value.
 
 `LIVY_API_KEY` is for legacy/local service-key provenance writes. Only set
 `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` if that API key has template
@@ -165,8 +154,15 @@ consent; publication and response reveal are the separately consented effects.
 ## Local Run
 
 ```bash
+LIVY_RESOLVER_AUTH_ENABLED=false \
+LIVY_RESOLVER_CREDITS_ENABLED=false \
+LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true \
 cargo run
 ```
+
+This single-replica exception only starts the local process. Source operations
+remain fail-closed until the configured Spider origin exposes the required
+same-origin egress-capability document described in the README.
 
 Server URL:
 
@@ -190,9 +186,15 @@ Use these for product/API clients:
 - `POST /search`
 - `POST /extract`
 - `POST /screenshot`
+- `POST /snapshot`
 - `POST /fetchfast`
 - `POST /fetchunblock`
 - `GET /receipt/{id}`
+- `GET /healthz`
+- `GET /readyz`
+- `GET /metrics` (restrict to the private metrics network)
+- `GET /.well-known/oauth-protected-resource` (also `/mcp` suffix)
+- `POST /mcp` (preferred MCP endpoint; `POST /` is a compatibility alias)
 
 Example:
 
@@ -219,7 +221,8 @@ to eliminate that residual cost-abuse window.
 
 ## Code Map
 
-- `src/main.rs`: mounts HTTP routes and `/mcp`
+- `src/main.rs`: starts the default environment-backed runtime
+- `src/app.rs`: mounts HTTP routes, lifecycle endpoints, metrics, and `/mcp`
 - `src/mcp.rs`: defines `fetch_source`
 - `src/fetch.rs`: reads `LIVY_RESOLVER_KEY`, calls Spider, stores receipts
 - `src/provenance.rs`: builds and posts generic resolver source-fetch
@@ -230,5 +233,8 @@ to eliminate that residual cost-abuse window.
 After changes, run:
 
 ```bash
-cargo check
+cargo fmt --all -- --check
+cargo check --locked --all-targets --all-features
+cargo test --locked --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```

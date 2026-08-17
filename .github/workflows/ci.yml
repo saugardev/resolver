@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "saugardev/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Rust, policy, secrets, and smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          test "$(rustc --version | awk '{print $2}')" = "1.94.0"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets and features
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Test all targets and features
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Lint without warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Validate checked-in contracts and scripts
+        run: |
+          ruby scripts/validate-contracts.rb
+          bash -n scripts/smoke.sh scripts/verify-fresh-checkout.sh
+          shellcheck scripts/smoke.sh scripts/verify-fresh-checkout.sh
+
+      - name: Install pinned audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-machete --version 0.9.2 --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Enforce dependency policy
+        run: cargo deny check advisories bans sources
+
+      - name: Detect unused direct dependencies
+        run: cargo machete
+
+      - name: Scan complete Git history for secrets
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "/tmp/${archive}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  /tmp/${archive}" | sha256sum --check --strict
+          tar -xzf "/tmp/${archive}" -C /tmp gitleaks
+          /tmp/gitleaks git --redact --verbose
+
+      - name: Verify a checkout with no sibling dependencies
+        run: scripts/verify-fresh-checkout.sh
+
+      - name: Run the service boundary smoke
+        run: scripts/smoke.sh
+
+  container:
+    name: Production container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build pinned non-root image
+        run: docker build --tag livy-resolver:ci .
+
+      - name: Verify image user and entrypoint
+        run: |
+          test "$(docker image inspect livy-resolver:ci --format '{{.Config.User}}')" = "10001:10001"
+          test "$(docker image inspect livy-resolver:ci --format '{{join .Config.Entrypoint " "}}')" = "/usr/local/bin/livy-resolver"
+
+      - name: Run hardened container smoke
+        run: |
+          container_id="$(docker run --detach --publish-all --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --env LIVY_RESOLVER_KEY=container-smoke-not-a-secret \
+            --env LIVY_RESOLVER_AUTH_ENABLED=false \
+            --env LIVY_RESOLVER_CREDITS_ENABLED=false \
+            --env LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true \
+            livy-resolver:ci)"
+          trap 'docker rm --force "${container_id}" >/dev/null 2>&1 || true' EXIT
+          host_port="$(docker port "${container_id}" 3001/tcp | awk -F: '{print $NF}')"
+          for _ in $(seq 1 50); do
+            if curl --fail --silent "http://127.0.0.1:${host_port}/healthz" >/tmp/container-health.json; then
+              break
+            fi
+            sleep 0.1
+          done
+          grep --fixed-strings '"status":"alive"' /tmp/container-health.json
+          test "$(curl --silent --output /tmp/container-ready.json --write-out '%{http_code}' \
+            "http://127.0.0.1:${host_port}/readyz")" = "503"
+          docker stop --time 15 "${container_id}"
