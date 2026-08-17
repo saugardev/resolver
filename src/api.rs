@@ -9,6 +9,7 @@ use axum::{
 
 use crate::auth::ResolverAuthContext;
 use crate::credits::ResolverCreditsClient;
+use crate::egress::EgressPolicy;
 use crate::errors::FetchError;
 use crate::fetch::Fetcher;
 use crate::types::{
@@ -73,9 +74,11 @@ pub async fn fetch_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Scrape)?;
+    egress.validate_source(payload.require_source()?).await?;
     debit_product_route(
         &credits,
         &auth_context,
@@ -94,9 +97,11 @@ pub async fn crawl_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Crawl)?;
+    egress.validate_source(payload.require_source()?).await?;
     debit_product_route(
         &credits,
         &auth_context,
@@ -115,9 +120,11 @@ pub async fn map_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Map)?;
+    egress.validate_source(payload.require_source()?).await?;
     debit_product_route(
         &credits,
         &auth_context,
@@ -157,9 +164,11 @@ pub async fn extract_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Extract)?;
+    egress.validate_source(payload.require_source()?).await?;
     debit_product_route(
         &credits,
         &auth_context,
@@ -178,9 +187,11 @@ pub async fn screenshot_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Screenshot)?;
+    egress.validate_source(payload.require_source()?).await?;
     debit_product_route(
         &credits,
         &auth_context,
@@ -199,9 +210,11 @@ pub async fn fetch_fast(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<FetchWithReceipt>, FetchError> {
     validate_source_url(&payload.source)?;
+    egress.validate_source(&payload.source).await?;
     debit_product_route(
         &credits,
         &auth_context,
@@ -232,9 +245,11 @@ pub async fn snapshot_source(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<crate::snapshot_upload::SnapshotPayload>, FetchError> {
     validate_source_url(&payload.source)?;
+    egress.validate_source(&payload.source).await?;
     debit_product_route(
         &credits,
         &auth_context,
@@ -252,9 +267,11 @@ pub async fn fetch_unblock(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<Value>, FetchError> {
     validate_source_url(&payload.source)?;
+    egress.validate_source(&payload.source).await?;
     debit_product_route(
         &credits,
         &auth_context,

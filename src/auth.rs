@@ -57,6 +57,8 @@ impl ResolverAuthContext {
 struct IntrospectionResponse {
     active: bool,
     #[serde(default)]
+    iss: Option<String>,
+    #[serde(default)]
     scope: String,
     #[serde(default)]
     aud: Option<AudienceValue>,
@@ -76,7 +78,7 @@ enum AudienceValue {
 }
 
 impl ResolverAuth {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
         let audience = normalize_url_identifier(
             env_value("LIVY_RESOLVER_OAUTH_AUDIENCE")
                 .or_else(|| env_value("RWA_RESOLVER_OAUTH_AUDIENCE"))
@@ -94,12 +96,15 @@ impl ResolverAuth {
         );
         let accepted_audiences = accepted_audiences(&audience);
 
-        Self {
+        Ok(Self {
             enabled: auth_enabled(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(crate::config::env_u64(
+                    "LIVY_RESOLVER_OAUTH_TIMEOUT_SECS",
+                    10,
+                )?))
                 .build()
-                .expect("resolver auth HTTP client should initialize"),
+                .map_err(|err| format!("resolver auth HTTP client could not initialize: {err}"))?,
             introspection_url: normalize_url_identifier(
                 env_value("LIVY_OAUTH_INTROSPECTION_URL")
                     .or_else(|| env_value("RWA_OAUTH_INTROSPECTION_URL"))
@@ -113,7 +118,7 @@ impl ResolverAuth {
             audience,
             accepted_audiences,
             resource_metadata_url,
-        }
+        })
     }
 
     async fn introspect(&self, token: &str) -> Result<IntrospectionResponse, String> {
@@ -139,12 +144,16 @@ impl ResolverAuth {
     }
 
     fn audience_allowed(&self, audiences: &[String]) -> bool {
-        if self.accepted_audiences.is_empty() {
-            return true;
-        }
         audiences
             .iter()
             .any(|audience| self.accepted_audiences.contains(audience))
+    }
+
+    fn issuer_allowed(&self, issuer: Option<&str>) -> bool {
+        issuer
+            .map(str::to_string)
+            .map(normalize_url_identifier)
+            .is_some_and(|issuer| issuer == self.authorization_server)
     }
 
     pub fn challenge(&self, required_scopes: &[&str], error: &str, description: &str) -> String {
@@ -190,6 +199,12 @@ impl ResolverAuth {
         };
 
         let audiences = audience_values(introspection.aud.as_ref());
+        if !self.issuer_allowed(introspection.iss.as_deref()) {
+            return Err(ResolverAuthError::Unauthorized {
+                error: "invalid_token",
+                message: "bearer token issuer is not valid for this resolver",
+            });
+        }
         if !self.audience_allowed(&audiences) {
             return Err(ResolverAuthError::Unauthorized {
                 error: "invalid_token",
@@ -335,11 +350,8 @@ fn parse_scope_list(scope: &str) -> Vec<&str> {
 
 fn scope_allows(granted_scopes: &[&str], required_scope: &str) -> bool {
     granted_scopes.iter().any(|scope| {
-        *scope == "*"
-            || *scope == required_scope
-            || *scope == "resolver:*"
-            || (*scope == "resolver" && required_scope.starts_with("resolver:"))
-            || (*scope == "mcp" && required_scope.starts_with("tool:"))
+        *scope == required_scope
+            || (*scope == "resolver:*" && required_scope.starts_with("resolver:"))
     })
 }
 
@@ -361,17 +373,13 @@ fn accepted_audiences(primary: &str) -> Vec<String> {
                 .into_iter()
                 .map(normalize_url_identifier),
         );
-    } else {
-        audiences.push(LEGACY_RESOLVER_AUDIENCE.to_string());
     }
     normalize_unique_list(audiences)
 }
 
 fn resolver_scopes_supported() -> Vec<&'static str> {
     vec![
-        "mcp",
         "tool:fetch_source",
-        "resolver:mcp:tools:list",
         "resolver:source:fetch",
         "resolver:source:crawl",
         "resolver:source:map",
@@ -497,7 +505,7 @@ fn header_quote(value: &str) -> String {
 mod tests {
     use super::{
         IntrospectionResponse, ResolverAuth, audience_values, header_quote,
-        normalize_url_identifier, oauth_protected_resource_metadata,
+        normalize_url_identifier, oauth_protected_resource_metadata, scope_allows,
     };
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
@@ -589,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn audience_check_accepts_current_and_legacy_resolver_audiences() {
+    fn audience_check_requires_explicitly_configured_audiences() {
         let auth = ResolverAuth {
             enabled: true,
             client: reqwest::Client::builder()
@@ -599,23 +607,34 @@ mod tests {
             introspection_url: "https://auth.livylabs.xyz/oauth/introspect".to_string(),
             authorization_server: "https://auth.livylabs.xyz".to_string(),
             audience: "https://resolver.api.livylabs.xyz/mcp".to_string(),
-            accepted_audiences: vec![
-                "https://resolver.api.livylabs.xyz/mcp".to_string(),
-                "https://resolver.api.livylabs.xyz".to_string(),
-            ],
+            accepted_audiences: vec!["https://resolver.api.livylabs.xyz/mcp".to_string()],
             resource_metadata_url:
                 "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
         };
 
         assert!(auth.audience_allowed(&["https://resolver.api.livylabs.xyz/mcp".to_string()]));
-        assert!(auth.audience_allowed(&["https://resolver.api.livylabs.xyz".to_string()]));
+        assert!(!auth.audience_allowed(&["https://resolver.api.livylabs.xyz".to_string()]));
         assert!(!auth.audience_allowed(&["https://api.livylabs.xyz".to_string()]));
+        assert!(auth.issuer_allowed(Some("https://auth.livylabs.xyz/")));
+        assert!(!auth.issuer_allowed(None));
+        assert!(!auth.issuer_allowed(Some("https://attacker.example")));
+    }
+
+    #[test]
+    fn scope_contract_does_not_accept_legacy_aliases() {
+        assert!(scope_allows(&["tool:fetch_source"], "tool:fetch_source"));
+        assert!(scope_allows(&["resolver:*"], "resolver:source:fetch"));
+        assert!(!scope_allows(&["resolver:*"], "tool:fetch_source"));
+        assert!(!scope_allows(&["*"], "tool:fetch_source"));
+        assert!(!scope_allows(&["mcp"], "tool:fetch_source"));
+        assert!(!scope_allows(&["resolver"], "resolver:source:fetch"));
     }
 
     #[test]
     fn introspection_response_parses_livy_tenant_project_claims() {
         let response: IntrospectionResponse = serde_json::from_value(json!({
             "active": true,
+            "iss": "https://auth.livylabs.xyz",
             "scope": "openid mcp tool:fetch_source",
             "aud": ["https://resolver.api.livylabs.xyz"],
             "client_id": "chatgpt-client",
@@ -626,6 +645,7 @@ mod tests {
 
         assert_eq!(response.tenant_id.as_deref(), Some("tenant-a"));
         assert_eq!(response.project_id.as_deref(), Some("project-a"));
+        assert_eq!(response.iss.as_deref(), Some("https://auth.livylabs.xyz"));
         assert_eq!(
             audience_values(response.aud.as_ref()),
             vec!["https://resolver.api.livylabs.xyz".to_string()]

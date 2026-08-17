@@ -14,10 +14,11 @@ const MAX_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// High-level route behavior exposed to API clients.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductMode {
     /// Let the service choose the default SmartMode path.
+    #[default]
     #[serde(alias = "smart", alias = "smart_mode")]
     Auto,
     /// Use the fast SmartMode + ISP proxy source-fetch path.
@@ -38,12 +39,6 @@ pub enum ProductMode {
     Extract,
     /// Return a page screenshot payload.
     Screenshot,
-}
-
-impl Default for ProductMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl ProductMode {
@@ -349,6 +344,8 @@ impl ProductRequest {
     }
 }
 
+/// Validate URL syntax only. Public request boundaries must also call
+/// [`crate::egress::EgressPolicy::validate_source`] before charging or fetching.
 pub fn validate_source_url(source: &str) -> Result<(), crate::errors::FetchError> {
     use crate::errors::FetchError;
 
@@ -657,7 +654,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_validation_allows_http_private_destinations() {
+    fn syntax_validation_defers_network_policy_to_the_egress_boundary() {
         assert!(validate_source_url("http://127.0.0.1:8080/path").is_ok());
         assert!(validate_source_url("https://example.com/path").is_ok());
     }

@@ -3,10 +3,7 @@
 use crate::auth::ResolverAuthContext;
 use crate::errors::ResolverCreditsError;
 use livy_provenance_sdk::DEFAULT_LIVY_API_BASE_URL;
-use reqwest::{
-    StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
-};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -279,6 +276,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
 
     #[test]
     fn idempotency_key_uses_client_supplied_value_when_present() {

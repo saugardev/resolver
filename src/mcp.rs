@@ -2,6 +2,7 @@
 
 use crate::auth::{ResolverAuth, ResolverAuthContext};
 use crate::credits::ResolverCreditsClient;
+use crate::egress::EgressPolicy;
 use crate::errors::ResolverAuthError;
 use crate::fetch::Fetcher;
 use crate::types::FetchWithReceipt;
@@ -29,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source", "resolver:source:fetch"];
+const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source"];
 const FETCH_SOURCE_TITLE: &str = "Fetch Source";
 const FETCH_SOURCE_INVOCATION_START: &str = "Fetching source";
 const FETCH_SOURCE_INVOCATION_DONE: &str = "Source fetched";
@@ -54,6 +55,7 @@ pub struct Server {
     fetcher: Arc<Fetcher>,
     auth: Arc<ResolverAuth>,
     credits: Arc<ResolverCreditsClient>,
+    egress: Arc<EgressPolicy>,
     fallback_cache: Arc<FetchFallbackCache>,
 }
 
@@ -132,12 +134,14 @@ impl Server {
         fetcher: Arc<Fetcher>,
         auth: Arc<ResolverAuth>,
         credits: Arc<ResolverCreditsClient>,
+        egress: Arc<EgressPolicy>,
         fallback_cache: Arc<FetchFallbackCache>,
     ) -> Self {
         Self {
             fetcher,
             auth,
             credits,
+            egress,
             fallback_cache,
         }
     }
@@ -150,8 +154,8 @@ impl Server {
         description = "Fetch the exact source URL supplied by the user using adaptive resolver routing. Use this whenever the prompt contains a source URL, `source: <url>`, `only take this source`, or says the URL is the source of truth. Do not perform web search or substitute another article.",
         annotations(
             title = "Fetch Source",
-            read_only_hint = true,
-            destructive_hint = false,
+            read_only_hint = false,
+            destructive_hint = true,
             open_world_hint = true
         ),
         meta = "fetch_source_tool_meta()"
@@ -164,7 +168,7 @@ impl Server {
             idempotency_key,
         }): Parameters<Params>,
     ) -> Result<CallToolResult, ErrorData> {
-        let auth_context = match self.require_oauth(&parts).await? {
+        let auth_context = match require_oauth_context(&self.auth, &parts)? {
             Ok(context) => context,
             Err(result) => return Ok(result),
         };
@@ -172,6 +176,12 @@ impl Server {
         if let Err(err) = validate_source_url(&url)
             .and_then(|_| validate_idempotency_key(idempotency_key.as_deref()))
         {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Invalid fetch_source request: {}",
+                public_validation_message(&err)
+            ))]));
+        }
+        if let Err(err) = self.egress.validate_source(&url).await {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Invalid fetch_source request: {}",
                 public_validation_message(&err)
@@ -349,7 +359,11 @@ async fn require_mcp_oauth_or_challenge(
         )
         .await
     {
-        Ok(_) => next.run(request).await,
+        Ok(context) => {
+            let mut request = request;
+            request.extensions_mut().insert(context);
+            next.run(request).await
+        }
         Err(ResolverAuthError::ServiceUnavailable(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -533,11 +547,11 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
                 let ui = meta_object
                     .entry("ui".to_string())
                     .or_insert_with(|| json!({}));
-                if let Some(ui_object) = ui.as_object_mut() {
-                    if !ui_object.contains_key("visibility") {
-                        ui_object.insert("visibility".to_string(), chatgpt_tool_visibility());
-                        changed = true;
-                    }
+                if let Some(ui_object) = ui.as_object_mut()
+                    && !ui_object.contains_key("visibility")
+                {
+                    ui_object.insert("visibility".to_string(), chatgpt_tool_visibility());
+                    changed = true;
                 }
                 if !meta_object.contains_key("securitySchemes") {
                     meta_object.insert(
@@ -575,11 +589,11 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
                     changed = true;
                 }
                 if !annotation_object.contains_key("readOnlyHint") {
-                    annotation_object.insert("readOnlyHint".to_string(), json!(true));
+                    annotation_object.insert("readOnlyHint".to_string(), json!(false));
                     changed = true;
                 }
                 if !annotation_object.contains_key("destructiveHint") {
-                    annotation_object.insert("destructiveHint".to_string(), json!(false));
+                    annotation_object.insert("destructiveHint".to_string(), json!(true));
                     changed = true;
                 }
                 if !annotation_object.contains_key("openWorldHint") {
@@ -607,37 +621,22 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
     changed
 }
 
-impl Server {
-    async fn require_oauth(
-        &self,
-        parts: &Parts,
-    ) -> Result<Result<ResolverAuthContext, CallToolResult>, ErrorData> {
-        match self
-            .auth
-            .validate_authorization_header(
-                parts.headers.get(header::AUTHORIZATION),
-                FETCH_SOURCE_SCOPES,
-            )
-            .await
-        {
-            Ok(context) => Ok(Ok(context)),
-            Err(ResolverAuthError::ServiceUnavailable(_)) => Err(ErrorData::internal_error(
-                "OAuth validation service is unavailable",
-                None,
-            )),
-            Err(err) => {
-                let Some((error, message)) = err.challenge_parts() else {
-                    return Err(ErrorData::internal_error("OAuth validation failed", None));
-                };
-                Ok(Err(oauth_challenge_result(
-                    &self.auth,
-                    FETCH_SOURCE_SCOPES,
-                    error,
-                    message,
-                )))
-            }
-        }
+fn require_oauth_context(
+    auth: &ResolverAuth,
+    parts: &Parts,
+) -> Result<Result<ResolverAuthContext, CallToolResult>, ErrorData> {
+    if let Some(context) = parts.extensions.get::<ResolverAuthContext>() {
+        return Ok(Ok(context.clone()));
     }
+
+    // HTTP middleware is the single authentication boundary. Re-introspecting here would
+    // double the auth dependency load and could produce inconsistent results mid-request.
+    Ok(Err(oauth_challenge_result(
+        auth,
+        FETCH_SOURCE_SCOPES,
+        "invalid_request",
+        "validated OAuth context is missing",
+    )))
 }
 
 fn oauth_challenge_result(
@@ -959,9 +958,9 @@ mod tests {
     use super::{
         FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Server,
         mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
-        structured_fetch_result,
+        require_oauth_context, structured_fetch_result,
     };
-    use crate::auth::ResolverAuth;
+    use crate::auth::{ResolverAuth, ResolverAuthContext};
     use crate::types::{FetchWithReceipt, Receipt};
     use axum::{body::to_bytes, http::header};
     use serde_json::json;
@@ -1006,13 +1005,13 @@ mod tests {
             tool.annotations
                 .as_ref()
                 .and_then(|annotations| annotations.read_only_hint),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             tool.annotations
                 .as_ref()
                 .and_then(|annotations| annotations.destructive_hint),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             tool.annotations
@@ -1046,6 +1045,30 @@ mod tests {
         assert!(challenge.contains("scope=\"tool:fetch_source\""));
         assert!(challenge.contains("error=\"invalid_request\""));
         assert!(challenge.contains("error_description=\"missing bearer token\""));
+    }
+
+    #[test]
+    fn tool_dispatch_reuses_middleware_auth_context() {
+        let expected = ResolverAuthContext {
+            access_token: Some("opaque-token".into()),
+            client_id: Some("connector".into()),
+            scopes: vec!["tool:fetch_source".into()],
+            audiences: vec!["https://resolver.api.livylabs.xyz/mcp".into()],
+            tenant_id: Some("tenant-a".into()),
+            project_id: Some("project-a".into()),
+        };
+        let request = axum::http::Request::builder()
+            .uri("/mcp")
+            .extension(expected.clone())
+            .body(())
+            .expect("request");
+        let (parts, _) = request.into_parts();
+
+        let actual = require_oauth_context(&ResolverAuth::for_tests(), &parts)
+            .expect("auth context lookup")
+            .expect("middleware context");
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -1117,6 +1140,10 @@ mod tests {
         );
         assert_eq!(
             message["result"]["tools"][0]["annotations"]["destructiveHint"],
+            true
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["annotations"]["readOnlyHint"],
             false
         );
         assert_eq!(

@@ -64,7 +64,7 @@ impl Fetcher {
     ) -> Result<ProductResponse, FetchError> {
         payload.validate_for(route)?;
         let mode = self.resolve_mode(payload.mode, route);
-        let timeout_secs = payload.timeout_secs.unwrap_or_else(|| match mode {
+        let timeout_secs = payload.timeout_secs.unwrap_or(match mode {
             ProductMode::Unblock => 50,
             ProductMode::Browser | ProductMode::Crawl | ProductMode::Screenshot => 45,
             _ => 25,
@@ -461,7 +461,7 @@ impl Fetcher {
                     .fingerprint
                     .unwrap_or(matches!(mode, ProductMode::Unblock)),
             ),
-            scroll: payload.scroll.or_else(|| {
+            scroll: payload.scroll.or({
                 if matches!(mode, ProductMode::Unblock) {
                     Some(1)
                 } else {

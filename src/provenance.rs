@@ -546,6 +546,10 @@ impl ProvenanceClient {
         Ok(format!("{}:{}", self.config.subject_prefix, &digest[..24]))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the ordered provenance schema is clearer when each committed field is explicit"
+    )]
     fn schema_fields(
         &self,
         subject_id: &str,

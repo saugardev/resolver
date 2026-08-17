@@ -83,6 +83,25 @@ pub async fn product_timeout(
     }
 }
 
+pub async fn mcp_timeout(
+    State(config): State<SecurityConfig>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(config.mcp_timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({
+                "error": "MCP request timed out",
+                "code": "mcp_request_timeout",
+                "request_id": current_request_id(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 fn incoming_request_id(request: &Request<Body>) -> Option<String> {
     let value = request.headers().get("x-request-id")?.to_str().ok()?;
     if value.is_empty()
