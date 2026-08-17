@@ -30,6 +30,8 @@ pub enum FetchError {
     PaymentRequired(String),
     #[error("Credit authorization failed")]
     Credits(String),
+    #[error("Idempotency key conflicts with a different request")]
+    IdempotencyConflict(String),
     #[error("Snapshot failed")]
     Snapshot(#[from] SnapshotError),
 }
@@ -65,6 +67,24 @@ pub enum ResolverCreditsError {
     InvalidHeader(String),
     #[error("credit request failed: {0}")]
     Http(reqwest::Error),
+    #[error("idempotency key was already bound to a different logical request")]
+    IdempotencyConflict,
+    #[error("idempotency key was already finalized and no durable prior result is available")]
+    IdempotencyAlreadyFinalized,
+    #[error("idempotency binding registry failed: {0}")]
+    IdempotencyRegistry(String),
+    #[error("insufficient user credits: balance {balance}, required {required}")]
+    InsufficientCredits { balance: i64, required: i64 },
+    #[error(
+        "untrusted credit debit outcome: mode={mode}, enforced={enforced}, charged={charged}, amount={amount}, expected_amount={expected_amount}"
+    )]
+    UntrustedDebitOutcome {
+        mode: String,
+        enforced: bool,
+        charged: bool,
+        amount: i64,
+        expected_amount: i64,
+    },
     #[error("credit request returned {status}: {}", compact_body(body))]
     Backend { status: StatusCode, body: String },
 }
@@ -72,12 +92,28 @@ pub enum ResolverCreditsError {
 impl ResolverCreditsError {
     pub fn is_payment_required(&self) -> bool {
         match self {
+            Self::InsufficientCredits { .. } => true,
             Self::Backend { status, body } => {
                 *status == StatusCode::PAYMENT_REQUIRED
                     || backend_error_code(body).as_deref() == Some("insufficient_user_credits")
             }
             _ => false,
         }
+    }
+
+    pub fn is_idempotency_conflict(&self) -> bool {
+        match self {
+            Self::IdempotencyConflict | Self::IdempotencyAlreadyFinalized => true,
+            Self::Backend { status, body } => {
+                *status == StatusCode::CONFLICT
+                    && backend_error_code(body).as_deref() == Some("idempotency_conflict")
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_idempotency_already_finalized(&self) -> bool {
+        matches!(self, Self::IdempotencyAlreadyFinalized)
     }
 }
 
@@ -150,6 +186,9 @@ impl IntoResponse for FetchError {
                 "credit_service_unavailable",
                 "Credit authorization service is unavailable".to_string(),
             ),
+            FetchError::IdempotencyConflict(message) => {
+                (StatusCode::CONFLICT, "idempotency_conflict", message)
+            }
             FetchError::Snapshot(_) => (
                 StatusCode::BAD_GATEWAY,
                 "invalid_upstream_snapshot",

@@ -14,11 +14,12 @@ const MAX_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// High-level route behavior exposed to API clients.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductMode {
     /// Let the service choose the default SmartMode path.
     #[serde(alias = "smart", alias = "smart_mode")]
+    #[default]
     Auto,
     /// Use the fast SmartMode + ISP proxy source-fetch path.
     Fast,
@@ -38,12 +39,6 @@ pub enum ProductMode {
     Extract,
     /// Return a page screenshot payload.
     Screenshot,
-}
-
-impl Default for ProductMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl ProductMode {
@@ -87,13 +82,23 @@ pub enum ProductFormat {
 }
 
 /// Single or multiple output format selection.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum FormatSelection {
     /// One requested format.
     One(ProductFormat),
     /// Multiple requested formats.
     Many(Vec<ProductFormat>),
+}
+
+/// Per-request consent for irreversible provenance side effects.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProvenanceConsent {
+    /// Allow a public attestation or managed publication when deployment policy permits it.
+    pub publish: bool,
+    /// Allow the exact upstream response to be included in a managed public artifact.
+    pub reveal_response: bool,
 }
 
 /// Proxy policy requested by the caller.
@@ -113,7 +118,7 @@ pub enum ProductProxy {
 }
 
 /// Product API request accepted by route handlers.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProductRequest {
     /// Exact URL to fetch, crawl, map, extract, or screenshot.
     #[serde(alias = "url")]
@@ -200,6 +205,8 @@ pub struct ProductRequest {
     pub max_credits_per_page: Option<f64>,
     /// Whether to create an in-memory receipt.
     pub receipt: Option<bool>,
+    /// Explicit consent for public provenance publication or response reveal.
+    pub provenance: Option<ProvenanceConsent>,
     /// Number of search results to request.
     pub search_limit: Option<u32>,
     /// Fetch content for search results.
@@ -276,6 +283,15 @@ impl ProductRequest {
                 "`max_credits_per_page` must be finite and greater than zero".into(),
             ));
         }
+        if self
+            .provenance
+            .as_ref()
+            .is_some_and(|consent| consent.reveal_response && !consent.publish)
+        {
+            return Err(FetchError::BadRequest(
+                "`provenance.reveal_response=true` requires `provenance.publish=true`".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -324,6 +340,7 @@ impl ProductRequest {
             lite_mode: None,
             max_credits_per_page: None,
             receipt: Some(false),
+            provenance: None,
             search_limit: None,
             fetch_page_content: None,
             quick_search: None,
@@ -566,6 +583,8 @@ pub enum ProductRoute {
     Extract,
     /// Screenshot capture.
     Screenshot,
+    /// Raw HTML plus screenshot snapshot capture.
+    Snapshot,
     /// Stealth unblock fetch.
     Unblock,
 }
@@ -580,12 +599,13 @@ impl ProductRoute {
             Self::Search => "search",
             Self::Extract => "extract",
             Self::Screenshot => "screenshot",
+            Self::Snapshot => "snapshot",
             Self::Unblock => "unblock",
         }
     }
 }
 
-/// In-memory provenance metadata for receipt-backed requests.
+/// Resolver metadata for a tenant-owned receipt-backed request.
 #[derive(Clone, Debug, Serialize)]
 pub struct Receipt {
     /// Receipt identifier.
@@ -698,5 +718,22 @@ mod tests {
         assert!(validate_idempotency_key(Some("bad key")).is_err());
         assert!(validate_receipt_id("18f-2").is_ok());
         assert!(validate_receipt_id("../../secret").is_err());
+    }
+
+    #[test]
+    fn provenance_consent_defaults_private_and_reveal_requires_publish() {
+        let request: ProductRequest = serde_json::from_value(serde_json::json!({
+            "source": "https://example.com"
+        }))
+        .unwrap();
+        assert!(request.provenance.is_none());
+        assert!(request.validate_for(ProductRoute::Scrape).is_ok());
+
+        let mut reveal_only = ProductRequest::legacy("https://example.com");
+        reveal_only.provenance = Some(ProvenanceConsent {
+            publish: false,
+            reveal_response: true,
+        });
+        assert!(reveal_only.validate_for(ProductRoute::Scrape).is_err());
     }
 }

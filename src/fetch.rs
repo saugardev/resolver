@@ -3,68 +3,212 @@
 use crate::auth::ResolverAuthContext;
 use crate::errors::FetchError;
 use crate::provenance::{ProvenanceClient, ResolverFetchEvidence};
+use crate::receipt_store::{ReceiptOwner, ReceiptStore, ReceiptStoreFactory, env_bool};
 use crate::snapshot_upload::SnapshotPayload;
 use crate::types::{
     FetchWithReceipt, FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest,
-    ProductResponse, ProductRoute, Receipt,
+    ProductResponse, ProductRoute, ProvenanceConsent, Receipt,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use spider_client::{
     CSSSelector, Delay, Engine, IdleNetwork, ProxyType, RequestParams, RequestType, ReturnFormat,
     ReturnFormatHandling, SearchRequestParams, Selector, Spider, Timeout, WaitFor,
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 pub struct Fetcher {
     spider: Spider,
     provenance: Option<ProvenanceClient>,
-    receipts: Mutex<HashMap<String, Receipt>>,
-    receipt_counter: AtomicU64,
+    receipts: Arc<dyn ReceiptStore>,
+}
+
+pub struct PendingProductFetch {
+    payload: ProductRequest,
+    route: ProductRoute,
+    mode: ProductMode,
+    should_receipt: bool,
+    receipt_owner: Option<ReceiptOwner>,
+    data: Value,
+}
+
+pub struct PendingSnapshot {
+    payload: ProductRequest,
+    owner: ReceiptOwner,
+    data: Value,
+    request_type: &'static str,
+    proxy: Option<String>,
 }
 
 impl Fetcher {
-    pub fn new() -> Self {
+    pub async fn from_receipt_store_factory(
+        factory: &dyn ReceiptStoreFactory,
+    ) -> Result<Self, FetchError> {
         dotenvy::dotenv().ok();
+        let receipts = factory
+            .create()
+            .await
+            .map_err(|err| FetchError::Http(err.to_string()))?;
+        Self::with_receipt_store(receipts).await
+    }
+
+    pub async fn with_receipt_store(receipts: Arc<dyn ReceiptStore>) -> Result<Self, FetchError> {
+        dotenvy::dotenv().ok();
+        let explicit_memory_exception = env_bool("LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS", false)
+            .map_err(|err| FetchError::Http(err.to_string()))?;
+        if !receipt_store_is_allowed(receipts.is_shared_durable(), explicit_memory_exception) {
+            return Err(FetchError::Http(
+                "non-durable receipt storage requires the explicit LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true exception in every environment"
+                    .to_string(),
+            ));
+        }
+        receipts
+            .health_check()
+            .await
+            .map_err(|err| FetchError::Http(format!("receipt store health check failed: {err}")))?;
         let key = std::env::var("LIVY_RESOLVER_KEY")
             .or_else(|_| std::env::var("SPIDER_API_KEY"))
             .or_else(|_| std::env::var("SPIDER_KEY"))
             .or_else(|_| std::env::var("LIVY_KEY"))
-            .expect("LIVY_RESOLVER_KEY must be set");
-        let spider = Spider::new(Some(key)).expect("Can initiate fetcher service");
+            .map_err(|_| FetchError::Http("LIVY_RESOLVER_KEY must be set".to_string()))?;
+        let spider = Spider::new(Some(key)).map_err(|err| FetchError::Http(err.to_string()))?;
         let provenance = ProvenanceClient::from_env()
-            .unwrap_or_else(|err| panic!("invalid provenance configuration: {err}"));
-        Fetcher {
+            .map_err(|err| FetchError::Http(format!("invalid provenance configuration: {err}")))?;
+        if !receipts.is_shared_durable() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "receipt_store_single_replica",
+                    "durable": false,
+                })
+            );
+        }
+        Ok(Fetcher {
             spider,
             provenance,
-            receipts: Mutex::new(HashMap::new()),
-            receipt_counter: AtomicU64::new(1),
-        }
+            receipts,
+        })
     }
 
-    pub async fn product_fetch(
-        &self,
-        payload: ProductRequest,
+    pub fn product_billing_context(
+        payload: &ProductRequest,
         route: ProductRoute,
-    ) -> Result<ProductResponse, FetchError> {
-        self.product_fetch_with_auth(payload, route, None).await
+    ) -> Result<Value, FetchError> {
+        payload.validate_for(route)?;
+        let mode = Self::resolve_mode(payload.mode, route);
+        let timeout_secs = payload.timeout_secs.unwrap_or(match mode {
+            ProductMode::Unblock => 50,
+            ProductMode::Browser | ProductMode::Crawl | ProductMode::Screenshot => 45,
+            _ => 25,
+        });
+        let should_receipt = payload.receipt.unwrap_or(matches!(
+            mode,
+            ProductMode::Auto | ProductMode::Fast | ProductMode::Extract
+        ));
+        let (operation, upstream_parameters) = match route {
+            ProductRoute::Search => {
+                let query = payload
+                    .query
+                    .as_deref()
+                    .ok_or_else(|| FetchError::BadRequest("search requires `query`".to_string()))?;
+                (
+                    "search",
+                    Self::serialized_upstream_parameters(Self::search_request_params(
+                        query, payload,
+                    ))?,
+                )
+            }
+            ProductRoute::Screenshot => {
+                let mut params = Self::request_params(payload, ProductMode::Screenshot);
+                params.return_format = Some(ReturnFormatHandling::Single(ReturnFormat::Screenshot));
+                ("screenshot", Self::serialized_upstream_parameters(params)?)
+            }
+            ProductRoute::Snapshot => (
+                "scrape_snapshot",
+                Self::serialized_upstream_parameters(Self::request_params(
+                    payload,
+                    ProductMode::Screenshot,
+                ))?,
+            ),
+            ProductRoute::Map => (
+                "links",
+                Self::serialized_upstream_parameters(Self::request_params(
+                    payload,
+                    ProductMode::Map,
+                ))?,
+            ),
+            ProductRoute::Crawl => (
+                "crawl",
+                Self::serialized_upstream_parameters(Self::request_params(
+                    payload,
+                    ProductMode::Crawl,
+                ))?,
+            ),
+            ProductRoute::Unblock => (
+                "unblock",
+                Self::serialized_upstream_parameters(Self::request_params(
+                    payload,
+                    ProductMode::Unblock,
+                ))?,
+            ),
+            ProductRoute::Extract | ProductRoute::Scrape if mode == ProductMode::Unblock => (
+                "unblock",
+                Self::serialized_upstream_parameters(Self::request_params(
+                    payload,
+                    ProductMode::Unblock,
+                ))?,
+            ),
+            ProductRoute::Extract | ProductRoute::Scrape => (
+                "scrape",
+                Self::serialized_upstream_parameters(Self::request_params(payload, payload.mode))?,
+            ),
+        };
+
+        Ok(json!({
+            "contract": "livy-resolver-logical-request-v1",
+            "kind": "product",
+            "route": route.as_str(),
+            "operation": operation,
+            "resolved_mode": mode,
+            "outer_timeout_secs": timeout_secs,
+            "receipt": should_receipt,
+            "source": payload.source,
+            "query": payload.query,
+            "upstream_parameters": upstream_parameters,
+            "validated_request": payload,
+        }))
     }
 
-    pub async fn product_fetch_with_auth(
+    pub fn receipt_billing_context(receipt_id: &str) -> Value {
+        json!({
+            "contract": "livy-resolver-logical-request-v1",
+            "kind": "receipt_read",
+            "route": "receipt",
+            "receipt_id": receipt_id,
+        })
+    }
+
+    pub async fn prepare_product_fetch_with_auth(
         &self,
         payload: ProductRequest,
         route: ProductRoute,
         auth_context: Option<&ResolverAuthContext>,
-    ) -> Result<ProductResponse, FetchError> {
+    ) -> Result<PendingProductFetch, FetchError> {
         payload.validate_for(route)?;
-        let mode = self.resolve_mode(payload.mode, route);
-        let timeout_secs = payload.timeout_secs.unwrap_or_else(|| match mode {
+        let mode = Self::resolve_mode(payload.mode, route);
+        let should_receipt = payload.receipt.unwrap_or(matches!(
+            mode,
+            ProductMode::Auto | ProductMode::Fast | ProductMode::Extract
+        ));
+        let receipt_owner = should_receipt
+            .then(|| ReceiptOwner::from_auth_context(auth_context))
+            .transpose()
+            .map_err(|err| FetchError::Http(err.to_string()))?;
+        let timeout_secs = payload.timeout_secs.unwrap_or(match mode {
             ProductMode::Unblock => 50,
             ProductMode::Browser | ProductMode::Crawl | ProductMode::Screenshot => 45,
             _ => 25,
@@ -90,6 +234,10 @@ impl Fetcher {
                 let source = Self::source(&payload)?;
                 self.screenshot(source, &payload, timeout_secs).await?
             }
+            ProductRoute::Snapshot => {
+                let source = Self::source(&payload)?;
+                self.scrape(source, &payload, timeout_secs).await?
+            }
             ProductRoute::Unblock => {
                 let source = Self::source(&payload)?;
                 self.unblock(source, &payload, timeout_secs).await?
@@ -105,23 +253,48 @@ impl Fetcher {
         };
 
         let data = Self::ensure_spider_success(data)?;
-        let should_receipt = payload.receipt.unwrap_or(matches!(
+        Ok(PendingProductFetch {
+            payload,
+            route,
             mode,
-            ProductMode::Auto | ProductMode::Fast | ProductMode::Extract
-        ));
+            should_receipt,
+            receipt_owner,
+            data,
+        })
+    }
+
+    pub async fn finalize_product_fetch_with_auth(
+        &self,
+        pending: PendingProductFetch,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<ProductResponse, FetchError> {
+        let PendingProductFetch {
+            payload,
+            route,
+            mode,
+            should_receipt,
+            receipt_owner,
+            data,
+        } = pending;
         let (receipt_id, receipt) = if should_receipt {
             let source = payload
                 .source
                 .as_deref()
                 .or(payload.query.as_deref())
                 .unwrap_or("unknown");
-            let receipt = self.store_receipt(
-                source,
-                &data,
-                mode.receipt_label(),
-                Self::request_type_name(mode),
-                Self::proxy_name(&payload, mode),
-            );
+            let owner = receipt_owner
+                .as_ref()
+                .ok_or_else(|| FetchError::Http("receipt owner was not resolved".to_string()))?;
+            let receipt = self
+                .store_receipt(
+                    owner,
+                    source,
+                    &data,
+                    mode.receipt_label(),
+                    Self::request_type_name(mode),
+                    Self::proxy_name(&payload, mode),
+                )
+                .await?;
             (Some(receipt.id.clone()), Some(receipt))
         } else {
             (None, None)
@@ -142,96 +315,109 @@ impl Fetcher {
         })
     }
 
-    pub async fn get_fast_data_with_receipt(
+    pub async fn finalize_product_fetch_with_receipt_with_auth(
         &self,
-        source: &str,
-    ) -> Result<FetchWithReceipt, FetchError> {
-        self.get_fast_data_with_receipt_with_auth(source, None)
-            .await
-    }
-
-    pub async fn get_fast_data_with_receipt_with_auth(
-        &self,
-        source: &str,
+        pending: PendingProductFetch,
         auth_context: Option<&ResolverAuthContext>,
     ) -> Result<FetchWithReceipt, FetchError> {
-        let payload = ProductRequest::fast(source);
         let response = self
-            .product_fetch_with_auth(payload, ProductRoute::Scrape, auth_context)
+            .finalize_product_fetch_with_auth(pending, auth_context)
             .await?;
-        let crawl = response.data;
         let receipt = response
             .receipt
             .ok_or_else(|| FetchError::Http("receipt was not created".to_string()))?;
 
         Ok(FetchWithReceipt {
             receipt_id: receipt.id.clone(),
-            receipt: receipt.clone(),
-            data: crawl,
+            receipt,
+            data: response.data,
             provenance: response.provenance,
             provenance_error: response.provenance_error,
         })
     }
 
-    pub async fn get_unblock_data_with_receipt_with_auth(
-        &self,
-        source: &str,
-        auth_context: Option<&ResolverAuthContext>,
-    ) -> Result<FetchWithReceipt, FetchError> {
+    pub fn snapshot_request(source: &str, provenance: Option<ProvenanceConsent>) -> ProductRequest {
         let mut payload = ProductRequest::fast(source);
-        payload.mode = ProductMode::Unblock;
+        payload.mode = ProductMode::Screenshot;
+        payload.formats = Some(vec![ProductFormat::Raw, ProductFormat::Screenshot]);
         payload.receipt = Some(true);
-        let response = self
-            .product_fetch_with_auth(payload, ProductRoute::Unblock, auth_context)
-            .await?;
-        let data = response.data;
-        let receipt = response
-            .receipt
-            .ok_or_else(|| FetchError::Http("receipt was not created".to_string()))?;
-
-        Ok(FetchWithReceipt {
-            receipt_id: receipt.id.clone(),
-            receipt: receipt.clone(),
-            data,
-            provenance: response.provenance,
-            provenance_error: response.provenance_error,
-        })
+        payload.stealth = Some(true);
+        payload.fingerprint = Some(true);
+        payload.provenance = provenance;
+        payload
     }
 
-    pub async fn snapshot_with_receipt(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
-        let formats = HashSet::from([ReturnFormat::Raw, ReturnFormat::Screenshot]);
-        let params = RequestParams {
-            return_format: Some(ReturnFormatHandling::Multi(formats)),
-            request: Some(RequestType::SmartMode),
-            stealth: Some(true),
-            fingerprint: Some(true),
-            proxy_enabled: Some(true),
-            ..Default::default()
-        };
+    pub async fn prepare_snapshot_with_auth(
+        &self,
+        payload: ProductRequest,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<PendingSnapshot, FetchError> {
+        payload.validate_for(ProductRoute::Snapshot)?;
+        let source = payload.require_source()?;
+        let owner = ReceiptOwner::from_auth_context(auth_context)
+            .map_err(|err| FetchError::Http(err.to_string()))?;
+        let params = Self::request_params(&payload, ProductMode::Screenshot);
+        let request_type = Self::request_type_name_from_params(&params);
+        let proxy = Self::proxy_name_from_params(&params).map(str::to_string);
 
         let data = self
             .spider
             .scrape_url(source, Some(params), "application/json")
             .await
             .map_err(FetchError::UnableFetch)?;
-        let crawl = Self::normalize_value(data)?;
-
-        SnapshotPayload::from_spider_response(source, crawl).map_err(FetchError::Snapshot)
+        let crawl = Self::ensure_spider_success(Self::normalize_value(data)?)?;
+        SnapshotPayload::validate_spider_response(&crawl).map_err(FetchError::Snapshot)?;
+        Ok(PendingSnapshot {
+            payload,
+            owner,
+            data: crawl,
+            request_type,
+            proxy,
+        })
     }
 
-    pub async fn unblocker(&self, source: &str) -> Result<serde_json::Value, FetchError> {
-        let mut payload = ProductRequest::fast(source);
-        payload.mode = ProductMode::Unblock;
-        payload.timeout_secs = Some(50);
-        payload.request_timeout_secs = Some(30);
-        payload.crawl_timeout_secs = Some(45);
-        payload.stealth = Some(true);
-        payload.fingerprint = Some(true);
-        payload.scroll = Some(1);
-        payload.receipt = Some(false);
-        self.product_fetch(payload, ProductRoute::Unblock)
-            .await
-            .map(|response| response.data)
+    pub async fn finalize_snapshot_with_auth(
+        &self,
+        pending: PendingSnapshot,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<SnapshotPayload, FetchError> {
+        let PendingSnapshot {
+            payload,
+            owner,
+            data: crawl,
+            request_type,
+            proxy,
+        } = pending;
+        let source = payload.require_source()?;
+        let receipt = self
+            .store_receipt(
+                &owner,
+                source,
+                &crawl,
+                ProductMode::Screenshot.receipt_label(),
+                request_type,
+                proxy.as_deref(),
+            )
+            .await?;
+        let (provenance, provenance_error) = self
+            .provenance_for(
+                &payload,
+                ProductRoute::Snapshot,
+                ProductMode::Screenshot,
+                &crawl,
+                Some(&receipt),
+                auth_context,
+            )
+            .await;
+
+        SnapshotPayload::from_spider_response(
+            source,
+            receipt.id,
+            crawl,
+            provenance,
+            provenance_error,
+        )
+        .map_err(FetchError::Snapshot)
     }
 
     async fn provenance_for(
@@ -281,7 +467,7 @@ impl Fetcher {
         payload: &ProductRequest,
         timeout_secs: u64,
     ) -> Result<Value, FetchError> {
-        let params = self.request_params(payload, payload.mode);
+        let params = Self::request_params(payload, payload.mode);
         Self::normalize_value(
             tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
@@ -300,7 +486,7 @@ impl Fetcher {
         payload: &ProductRequest,
         timeout_secs: u64,
     ) -> Result<Value, FetchError> {
-        let params = self.request_params(payload, ProductMode::Unblock);
+        let params = Self::request_params(payload, ProductMode::Unblock);
         Self::normalize_value(
             tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
@@ -319,7 +505,7 @@ impl Fetcher {
         payload: &ProductRequest,
         timeout_secs: u64,
     ) -> Result<Value, FetchError> {
-        let params = self.request_params(payload, ProductMode::Crawl);
+        let params = Self::request_params(payload, ProductMode::Crawl);
         Self::normalize_value(
             tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
@@ -343,7 +529,7 @@ impl Fetcher {
         payload: &ProductRequest,
         timeout_secs: u64,
     ) -> Result<Value, FetchError> {
-        let params = self.request_params(payload, ProductMode::Map);
+        let params = Self::request_params(payload, ProductMode::Map);
         Self::normalize_value(
             tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
@@ -362,7 +548,7 @@ impl Fetcher {
         payload: &ProductRequest,
         timeout_secs: u64,
     ) -> Result<Value, FetchError> {
-        let mut params = self.request_params(payload, ProductMode::Screenshot);
+        let mut params = Self::request_params(payload, ProductMode::Screenshot);
         params.return_format = Some(ReturnFormatHandling::Single(ReturnFormat::Screenshot));
         Self::normalize_value(
             tokio::time::timeout(
@@ -382,17 +568,7 @@ impl Fetcher {
         payload: &ProductRequest,
         timeout_secs: u64,
     ) -> Result<Value, FetchError> {
-        let base = self.request_params(payload, ProductMode::Search);
-        let params = SearchRequestParams {
-            base,
-            search: query.to_string(),
-            search_limit: payload.search_limit.or(payload.limit),
-            fetch_page_content: payload.fetch_page_content,
-            num: payload.limit,
-            quick_search: payload.quick_search,
-            engine: payload.engine.as_deref().and_then(parse_engine),
-            ..Default::default()
-        };
+        let params = Self::search_request_params(query, payload);
         Self::normalize_value(
             tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
@@ -406,13 +582,14 @@ impl Fetcher {
     }
 
     /// Resolve the route into the mode that should be executed.
-    fn resolve_mode(&self, mode: ProductMode, route: ProductRoute) -> ProductMode {
+    fn resolve_mode(mode: ProductMode, route: ProductRoute) -> ProductMode {
         match route {
             ProductRoute::Crawl => ProductMode::Crawl,
             ProductRoute::Map => ProductMode::Map,
             ProductRoute::Search => ProductMode::Search,
             ProductRoute::Extract => ProductMode::Extract,
             ProductRoute::Screenshot => ProductMode::Screenshot,
+            ProductRoute::Snapshot => ProductMode::Screenshot,
             ProductRoute::Unblock => ProductMode::Unblock,
             ProductRoute::Scrape => mode,
         }
@@ -424,7 +601,7 @@ impl Fetcher {
     }
 
     /// Build Spider request params from product options.
-    fn request_params(&self, payload: &ProductRequest, mode: ProductMode) -> RequestParams {
+    fn request_params(payload: &ProductRequest, mode: ProductMode) -> RequestParams {
         RequestParams {
             request: Some(Self::request_type(mode)),
             return_format: Some(Self::return_format(payload, mode)),
@@ -461,7 +638,7 @@ impl Fetcher {
                     .fingerprint
                     .unwrap_or(matches!(mode, ProductMode::Unblock)),
             ),
-            scroll: payload.scroll.or_else(|| {
+            scroll: payload.scroll.or({
                 if matches!(mode, ProductMode::Unblock) {
                     Some(1)
                 } else {
@@ -491,6 +668,46 @@ impl Fetcher {
         }
     }
 
+    fn search_request_params(query: &str, payload: &ProductRequest) -> SearchRequestParams {
+        SearchRequestParams {
+            base: Self::request_params(payload, ProductMode::Search),
+            search: query.to_string(),
+            search_limit: payload.search_limit.or(payload.limit),
+            fetch_page_content: payload.fetch_page_content,
+            num: payload.limit,
+            quick_search: payload.quick_search,
+            engine: payload.engine.as_deref().and_then(parse_engine),
+            ..Default::default()
+        }
+    }
+
+    fn serialized_upstream_parameters<T: serde::Serialize>(params: T) -> Result<Value, FetchError> {
+        let mut value = serde_json::to_value(params)?;
+        Self::normalize_unordered_upstream_values(&mut value);
+        Ok(value)
+    }
+
+    fn normalize_unordered_upstream_values(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    Self::normalize_unordered_upstream_values(value);
+                    if key == "return_format"
+                        && let Some(formats) = value.as_array_mut()
+                    {
+                        formats.sort_by_key(Value::to_string);
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    Self::normalize_unordered_upstream_values(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Select the Spider request type for a product mode.
     fn request_type(mode: ProductMode) -> RequestType {
         match mode {
@@ -508,6 +725,15 @@ impl Fetcher {
             RequestType::Http => "http",
             RequestType::Chrome => "chrome",
             RequestType::SmartMode => "smart",
+        }
+    }
+
+    fn request_type_name_from_params(params: &RequestParams) -> &'static str {
+        match params.request.as_ref() {
+            Some(RequestType::Http) => "http",
+            Some(RequestType::Chrome) => "chrome",
+            Some(RequestType::SmartMode) => "smart",
+            None => "unspecified",
         }
     }
 
@@ -531,6 +757,10 @@ impl Fetcher {
     /// Human-readable proxy name for receipts.
     fn proxy_name(payload: &ProductRequest, mode: ProductMode) -> Option<&'static str> {
         Self::proxy_type(payload, mode).map(|proxy| proxy.as_str())
+    }
+
+    fn proxy_name_from_params(params: &RequestParams) -> Option<&str> {
+        params.proxy.as_ref().map(ProxyType::as_str)
     }
 
     /// Default upstream request timeout for each mode.
@@ -660,22 +890,29 @@ impl Fetcher {
         Ok(value)
     }
 
-    pub fn get_receipt(&self, id: &str) -> Option<Receipt> {
+    pub async fn get_receipt(
+        &self,
+        id: &str,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<Option<Receipt>, FetchError> {
+        let owner = ReceiptOwner::from_auth_context(auth_context)
+            .map_err(|err| FetchError::Http(err.to_string()))?;
         self.receipts
-            .lock()
-            .ok()
-            .and_then(|receipts| receipts.get(id).cloned())
+            .get(&owner, id)
+            .await
+            .map_err(|err| FetchError::Http(err.to_string()))
     }
 
-    fn store_receipt(
+    async fn store_receipt(
         &self,
+        owner: &ReceiptOwner,
         source: &str,
         value: &Value,
         mode: &str,
         request_type: &str,
         proxy: Option<&str>,
-    ) -> Receipt {
-        let id = self.next_receipt_id();
+    ) -> Result<Receipt, FetchError> {
+        let id = new_receipt_id();
         let first = value.as_array().and_then(|items| items.first());
         let status = first
             .and_then(|item| item.get("status"))
@@ -712,16 +949,12 @@ impl Fetcher {
             demo_message: "amazing job".to_string(),
         };
 
-        if let Ok(mut receipts) = self.receipts.lock() {
-            receipts.insert(receipt.id.clone(), receipt.clone());
-        }
+        self.receipts
+            .put(owner, receipt.clone())
+            .await
+            .map_err(|err| FetchError::Http(err.to_string()))?;
 
-        receipt
-    }
-
-    fn next_receipt_id(&self) -> String {
-        let sequence = self.receipt_counter.fetch_add(1, Ordering::Relaxed);
-        format!("{:x}-{:x}", Self::now_unix_ms(), sequence)
+        Ok(receipt)
     }
 
     fn now_unix_ms() -> u128 {
@@ -732,6 +965,14 @@ impl Fetcher {
     }
 }
 
+fn new_receipt_id() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+fn receipt_store_is_allowed(is_shared_durable: bool, explicit_memory_exception: bool) -> bool {
+    is_shared_durable || explicit_memory_exception
+}
+
 /// Parse product search engine strings.
 fn parse_engine(engine: &str) -> Option<Engine> {
     match engine.to_ascii_lowercase().as_str() {
@@ -739,5 +980,74 @@ fn parse_engine(engine: &str) -> Option<Engine> {
         "brave" => Some(Engine::Brave),
         "all" => Some(Engine::All),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Fetcher, new_receipt_id, receipt_store_is_allowed};
+    use crate::types::{ProductFormat, ProductMode, ProductRequest, ProductRoute};
+
+    #[test]
+    fn receipt_ids_are_random_uuid_values() {
+        let first = new_receipt_id();
+        let second = new_receipt_id();
+
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn non_durable_receipts_always_require_an_explicit_exception() {
+        assert!(receipt_store_is_allowed(true, false));
+        assert!(receipt_store_is_allowed(true, true));
+        assert!(!receipt_store_is_allowed(false, false));
+        assert!(receipt_store_is_allowed(false, true));
+    }
+
+    #[test]
+    fn snapshot_billing_and_receipt_metadata_use_the_exact_execution_params() {
+        let payload = Fetcher::snapshot_request("https://example.com/private", None);
+        let executed = Fetcher::request_params(&payload, ProductMode::Screenshot);
+        let recorded = Fetcher::product_billing_context(&payload, ProductRoute::Snapshot).unwrap();
+
+        assert_eq!(
+            recorded["upstream_parameters"],
+            Fetcher::serialized_upstream_parameters(&executed).unwrap()
+        );
+        assert_eq!(recorded["route"], "snapshot");
+        assert_eq!(recorded["operation"], "scrape_snapshot");
+        assert_eq!(Fetcher::request_type_name_from_params(&executed), "chrome");
+        assert_eq!(
+            Fetcher::proxy_name_from_params(&executed),
+            executed
+                .proxy
+                .as_ref()
+                .map(spider_client::ProxyType::as_str)
+        );
+        assert_eq!(
+            payload.formats,
+            Some(vec![ProductFormat::Raw, ProductFormat::Screenshot])
+        );
+    }
+
+    #[test]
+    fn billing_context_covers_search_effective_options_and_receipt_identity() {
+        let mut search = ProductRequest::legacy("https://unused.example");
+        search.source = None;
+        search.query = Some("private query".to_string());
+        search.search_limit = Some(7);
+        search.fetch_page_content = Some(true);
+        let context = Fetcher::product_billing_context(&search, ProductRoute::Search).unwrap();
+
+        assert_eq!(context["query"], "private query");
+        assert_eq!(context["route"], "search");
+        assert_eq!(context["upstream_parameters"]["search_limit"], 7);
+        assert_eq!(context["upstream_parameters"]["fetch_page_content"], true);
+        assert_eq!(
+            Fetcher::receipt_billing_context("opaque-receipt")["receipt_id"],
+            "opaque-receipt"
+        );
     }
 }

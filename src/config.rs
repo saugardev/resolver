@@ -73,6 +73,6 @@ mod tests {
     #[test]
     fn defaults_are_bounded() {
         assert_eq!(DEFAULT_PRODUCT_BODY_BYTES, 65_536);
-        assert!(DEFAULT_PRODUCT_TIMEOUT_SECS > 60);
+        assert_eq!(DEFAULT_PRODUCT_TIMEOUT_SECS, 65);
     }
 }

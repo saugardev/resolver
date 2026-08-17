@@ -1,7 +1,7 @@
 use crate::errors::SnapshotError;
+use crate::provenance::ProvenanceResult;
 use serde::Serialize;
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotPayload {
@@ -9,26 +9,41 @@ pub struct SnapshotPayload {
     pub receipt_id: String,
     pub html: String,
     pub screenshot_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_error: Option<String>,
 }
 
 impl SnapshotPayload {
-    pub fn from_spider_response(source_url: &str, response: Value) -> Result<Self, SnapshotError> {
+    pub fn validate_spider_response(response: &Value) -> Result<(), SnapshotError> {
+        find_string_by_keys(response, &["raw", "html"])
+            .or_else(|| find_content_string(response))
+            .ok_or(SnapshotError::MissingHtml)?;
+        find_string_by_keys(response, &["screenshot"]).ok_or(SnapshotError::MissingScreenshot)?;
+        Ok(())
+    }
+
+    pub fn from_spider_response(
+        source_url: &str,
+        receipt_id: String,
+        response: Value,
+        provenance: Option<ProvenanceResult>,
+        provenance_error: Option<String>,
+    ) -> Result<Self, SnapshotError> {
         let html = find_string_by_keys(&response, &["raw", "html"])
             .or_else(|| find_content_string(&response))
             .ok_or(SnapshotError::MissingHtml)?;
         let screenshot_base64 = find_string_by_keys(&response, &["screenshot"])
             .ok_or(SnapshotError::MissingScreenshot)?;
-        let receipt_id = find_string_by_keys(
-            &response,
-            &["receipt_id", "receiptId", "request_id", "requestId", "id"],
-        )
-        .unwrap_or_else(new_receipt_id);
 
         Ok(Self {
             source_url: source_url.to_string(),
             receipt_id,
             html,
             screenshot_base64,
+            provenance,
+            provenance_error,
         })
     }
 }
@@ -70,10 +85,38 @@ fn value_to_string(value: &Value) -> Option<String> {
     value.as_str().map(ToString::to_string)
 }
 
-fn new_receipt_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    format!("snapshot-{millis}")
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn uses_the_resolver_owned_receipt_id() {
+        let snapshot = SnapshotPayload::from_spider_response(
+            "https://example.com",
+            "resolver-generated-id".to_string(),
+            json!({
+                "id": "predictable-upstream-id",
+                "raw": "<html></html>",
+                "screenshot": "c2NyZWVuc2hvdA=="
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.receipt_id, "resolver-generated-id");
+    }
+
+    #[test]
+    fn validates_required_snapshot_fields_before_side_effects() {
+        assert!(SnapshotPayload::validate_spider_response(&json!({"raw": "html"})).is_err());
+        assert!(
+            SnapshotPayload::validate_spider_response(&json!({
+                "raw": "html",
+                "screenshot": "bytes"
+            }))
+            .is_ok()
+        );
+    }
 }

@@ -33,6 +33,8 @@ pub struct ResolverAuth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolverAuthContext {
     pub access_token: Option<String>,
+    /// Stable OAuth resource-owner subject (`sub`) from token introspection.
+    pub subject: Option<String>,
     pub client_id: Option<String>,
     pub scopes: Vec<String>,
     pub audiences: Vec<String>,
@@ -44,6 +46,7 @@ impl ResolverAuthContext {
     fn local_dev() -> Self {
         Self {
             access_token: None,
+            subject: None,
             client_id: None,
             scopes: vec!["*".to_string()],
             audiences: Vec::new(),
@@ -56,6 +59,8 @@ impl ResolverAuthContext {
 #[derive(Debug, Deserialize)]
 struct IntrospectionResponse {
     active: bool,
+    #[serde(default)]
+    sub: Option<String>,
     #[serde(default)]
     scope: String,
     #[serde(default)]
@@ -222,9 +227,17 @@ impl ResolverAuth {
                 message: "bearer token is missing Livy project claim",
             });
         }
+        let subject = non_empty(introspection.sub);
+        if subject.is_none() {
+            return Err(ResolverAuthError::Unauthorized {
+                error: "invalid_token",
+                message: "bearer token is missing OAuth subject claim",
+            });
+        }
 
         Ok(ResolverAuthContext {
             access_token: Some(token),
+            subject,
             client_id: non_empty(introspection.client_id),
             scopes: scopes.into_iter().map(str::to_string).collect(),
             audiences,
@@ -496,9 +509,11 @@ fn header_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        IntrospectionResponse, ResolverAuth, audience_values, header_quote,
+        IntrospectionResponse, ResolverAuth, ResolverAuthError, audience_values, header_quote,
         normalize_url_identifier, oauth_protected_resource_metadata,
     };
+    use axum::{Json, Router, routing::post};
+    use reqwest::header::HeaderValue;
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
 
@@ -616,6 +631,7 @@ mod tests {
     fn introspection_response_parses_livy_tenant_project_claims() {
         let response: IntrospectionResponse = serde_json::from_value(json!({
             "active": true,
+            "sub": "user-a",
             "scope": "openid mcp tool:fetch_source",
             "aud": ["https://resolver.api.livylabs.xyz"],
             "client_id": "chatgpt-client",
@@ -626,9 +642,56 @@ mod tests {
 
         assert_eq!(response.tenant_id.as_deref(), Some("tenant-a"));
         assert_eq!(response.project_id.as_deref(), Some("project-a"));
+        assert_eq!(response.sub.as_deref(), Some("user-a"));
         assert_eq!(
             audience_values(response.aud.as_ref()),
             vec!["https://resolver.api.livylabs.xyz".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn active_introspection_without_subject_is_rejected() {
+        let app = Router::new().route(
+            "/introspect",
+            post(|| async {
+                Json(json!({
+                    "active": true,
+                    "scope": "tool:fetch_source",
+                    "aud": "https://resolver.api.livylabs.xyz/mcp",
+                    "client_id": "client-a",
+                    "https://claims.livylabs.xyz/tenant_id": "tenant-a",
+                    "https://claims.livylabs.xyz/project_id": "project-a"
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let auth = ResolverAuth {
+            enabled: true,
+            client: reqwest::Client::new(),
+            introspection_url: format!("http://{address}/introspect"),
+            authorization_server: "https://auth.livylabs.xyz".to_string(),
+            audience: "https://resolver.api.livylabs.xyz/mcp".to_string(),
+            accepted_audiences: vec!["https://resolver.api.livylabs.xyz/mcp".to_string()],
+            resource_metadata_url:
+                "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
+        };
+
+        let result = auth
+            .validate_authorization_header(
+                Some(&HeaderValue::from_static("Bearer token")),
+                &["tool:fetch_source"],
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ResolverAuthError::Unauthorized {
+                error: "invalid_token",
+                message: "bearer token is missing OAuth subject claim",
+            })
+        ));
+
+        server.abort();
     }
 }

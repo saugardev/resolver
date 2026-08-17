@@ -31,6 +31,9 @@ Unauthenticated MCP requests, including `initialize` and `tools/list`, return
 HTTP `401` with `WWW-Authenticate` so Claude can discover the OAuth protected
 resource and show the sign-in flow. Local-only unauthenticated development can
 set `LIVY_RESOLVER_AUTH_ENABLED=false`.
+When authentication is disabled for local development, also explicitly set
+`LIVY_RESOLVER_CREDITS_ENABLED=false`; enabled credit enforcement requires an
+authenticated access token and fails closed without one.
 
 ```dotenv
 LIVY_OAUTH_ISSUER=https://auth.livylabs.xyz
@@ -46,7 +49,9 @@ fetch. This branch records generic resolver source-fetch proofs with:
 
 - `attestation_claim=source`
 - `subject_type=resolver_fetch`
-- `schema_id=resolver-fetch-v1`
+- `schema_id=resolver-fetch-v1`, `schema_version=1` (the current backend contract)
+- the public `source` field contains only a stable `sha256:<digest>` commitment,
+  never the raw URL or query
 - `integration_id=delphi` by default
 
 This is intentionally not the `prediction_market_resolver` template. Use
@@ -76,19 +81,28 @@ Optional settings:
 LIVY_API_KEY=livy_...
 LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v1
 LIVY_PROVENANCE_SCHEMA_VERSION=1
-LIVY_PROVENANCE_VISIBILITY=public
+LIVY_PROVENANCE_VISIBILITY=private
 LIVY_PROVENANCE_VERIFICATION_MODE=verify_fresh
 LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
-LIVY_PROVENANCE_MANAGED_PUBLICATION=true
-LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=true
+LIVY_PROVENANCE_MANAGED_PUBLICATION=false
+LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false
+LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=false
 LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES=262144
 LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=false
 LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS=30
 LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS=2000
 ```
 
-`LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local or staging backends.
+`LIVY_PROVENANCE_ENABLED=true` is the only setting that activates provenance;
+shared backend URLs and service credentials never activate it implicitly.
+`LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local
+or staging backends.
+
+The current Livy backend accepts only `resolver-fetch-v1@1`; the resolver
+fails startup on any other configured schema instead of making incompatible
+calls. A future v2 schema requires a coordinated external backend registry and
+API rollout before this client can adopt it.
 
 `LIVY_API_KEY` is only used for legacy/local service-key provenance writes.
 Production service-key writes are disabled unless
@@ -110,9 +124,16 @@ the request summary records only their presence or count. Artifacts larger than
 `LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES` remain commitment-only so an
 oversized reveal cannot block receipt publication. Set
 `LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false` to keep every response
-commitment-only. Response artifacts default on for public provenance and off
-for private provenance. Managed publication is public and irreversible, so
-enable it only for resolver outputs that are safe to disclose. The resolver
+commitment-only. Response artifacts and managed publication default off, and
+the source URL is a commitment field rather than a public value. Public
+visibility or managed publication additionally requires the explicit
+`LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=true` deployment capability and an
+authenticated per-request `provenance.publish=true` consent. Revealing the
+upstream response additionally requires per-request
+`provenance.reveal_response=true`. Both request values default to false; a
+deployment flag alone never publishes or reveals data. Managed publication is
+public and irreversible, so enable it only for resolver outputs that are safe
+to disclose. The resolver
 still returns the attestation immediately. Set
 `LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=true` only when the caller should wait
 for public `registry_refs`; that mode requires the API key to have provenance
@@ -144,7 +165,7 @@ Response shape:
 }
 ```
 
-Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|crawl|map|search|extract|screenshot`), `format`, `proxy`, `receipt`.
+Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|crawl|map|search|extract|screenshot`), `format`, `proxy`, `receipt`, and optional consent `provenance: { "publish": false, "reveal_response": false }`.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -159,6 +180,49 @@ Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|cr
 | GET | `/receipt/{id}` | Read receipt |
 
 Prefer `/fetch` with `mode` over the compat routes.
+
+Send one validated `Idempotency-Key` header on product requests and reuse it
+only when retrying the same logical request. The resolver scopes and hashes the
+key with the authenticated OAuth subject, tenant, project, client, and route
+before sending it to the credit service. OAuth introspection must therefore
+return a non-empty `sub`. The backend key is bound to a canonical fingerprint of
+the complete validated execution plan, caller key, authenticated scope,
+effective amount, and pricing version. Reusing a caller key for a different
+request returns HTTP 409 within a replica; across replicas the different
+fingerprint produces a different debit key, so it cannot reuse the first
+request's debit. Once a replica has captured a request, retrying that same key
+returns HTTP 409 before Spider because the resolver has no durable prior-result
+cache. After a restart, a generic credit-ledger row is never accepted as proof
+of an enforced capture: insufficient balance still fails before Spider.
+`LIVY_RESOLVER_REQUEST_CREDIT_COST` is the default price; deployments can set
+route-specific overrides such as `LIVY_RESOLVER_CREDIT_COST_CRAWL`,
+`LIVY_RESOLVER_CREDIT_COST_SCREENSHOT`, and
+`LIVY_RESOLVER_CREDIT_COST_MCP_FETCH_SOURCE`. The resolver performs a
+non-consuming balance preflight before Spider, executes the upstream request,
+captures the debit only after upstream success, and only then stores a receipt
+or writes provenance. Failed upstream attempts are not debited. Credit
+responses that are neither enforced nor an idempotent replay fail closed.
+
+The current backend does not provide an atomic reserve/capture operation or a
+transactional caller-key-to-fingerprint conflict check. A backend enhancement
+must atomically reserve sufficient balance with the caller-key scope and
+request fingerprint, return 409 `idempotency_conflict` for a different
+fingerprint, and capture/release that reservation after success/failure. Until
+that rollout, the GET preflight has an unavoidable concurrent-spend race; the
+final debit still fails closed before receipt/provenance side effects.
+
+Receipt identifiers are random and lookup is scoped to the authenticated
+tenant and project. The default in-memory store expires records after 15
+minutes and keeps at most 10,000 records. It is not durable or replica-shared,
+so every environment refuses it unless
+`LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true` explicitly acknowledges a
+single-replica exception. This repository does not claim or ship a durable
+implementation; applications can inject an async shared durable `ReceiptStore`
+through `ReceiptStoreFactory`. The library exports
+`build_app_with_receipt_store_factory` and `run_with_receipt_store_factory` so
+an application can supply that factory without using the default environment
+factory. Factory creation and store health checks are async; startup and
+`/readyz` fail closed when the supplied store is unavailable.
 
 ## API security
 
@@ -197,7 +261,8 @@ rejections, and gateway 429 responses. Do not attach raw source URLs as labels.
 - Endpoint: `/mcp`
 - Protected resource metadata: `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`, including `resource_name` and the Livy OAuth introspection endpoint
 - Server: `livygensyn-source-fetcher`
-- Tool: `fetch_source` — input `{ "url": "..." }`
+- Tool: `fetch_source` — input `{ "url": "...", "publish_provenance": false, "reveal_provenance_response": false }`
+- Side effects: the descriptor truthfully marks the tool non-read-only and destructive because successful calls debit credits and store a tenant receipt; enabled provenance may create a private attestation, while public publication/reveal occurs only with authenticated explicit consent and deployment capability
 - Output: successful calls include both `receipt_id` and `explorer`, where `explorer` is `https://explorer.livylabs.xyz/?q=<receipt_id>` with the actual receipt id substituted
 - Auth: protected MCP requests require `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver MCP endpoint audience
 - Discovery: unauthenticated MCP requests return HTTP `401` with `WWW-Authenticate` pointing at the protected-resource metadata URL. After OAuth, clients can call `initialize`, `notifications/initialized`, and `tools/list` with the bearer token. The tool implementation keeps `_meta["mcp/www_authenticate"]` compatibility for contexts that reach tool dispatch directly.
