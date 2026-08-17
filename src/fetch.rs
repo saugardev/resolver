@@ -3,6 +3,7 @@
 use crate::auth::ResolverAuthContext;
 use crate::errors::FetchError;
 use crate::provenance::{ProvenanceClient, ResolverFetchEvidence};
+use crate::receipt_store::{InMemoryReceiptStore, ReceiptOwner, ReceiptStore};
 use crate::snapshot_upload::SnapshotPayload;
 use crate::types::{
     FetchWithReceipt, FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest,
@@ -15,45 +16,50 @@ use spider_client::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 pub struct Fetcher {
     spider: Spider,
     provenance: Option<ProvenanceClient>,
-    receipts: Mutex<HashMap<String, Receipt>>,
-    receipt_counter: AtomicU64,
+    receipts: Arc<dyn ReceiptStore>,
 }
 
 impl Fetcher {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, FetchError> {
+        dotenvy::dotenv().ok();
+        let receipts = Arc::new(
+            InMemoryReceiptStore::from_env().map_err(|err| FetchError::Http(err.to_string()))?,
+        );
+        Self::with_receipt_store(receipts)
+    }
+
+    pub fn with_receipt_store(receipts: Arc<dyn ReceiptStore>) -> Result<Self, FetchError> {
         dotenvy::dotenv().ok();
         let key = std::env::var("LIVY_RESOLVER_KEY")
             .or_else(|_| std::env::var("SPIDER_API_KEY"))
             .or_else(|_| std::env::var("SPIDER_KEY"))
             .or_else(|_| std::env::var("LIVY_KEY"))
-            .expect("LIVY_RESOLVER_KEY must be set");
-        let spider = Spider::new(Some(key)).expect("Can initiate fetcher service");
+            .map_err(|_| FetchError::Http("LIVY_RESOLVER_KEY must be set".to_string()))?;
+        let spider = Spider::new(Some(key)).map_err(|err| FetchError::Http(err.to_string()))?;
         let provenance = ProvenanceClient::from_env()
-            .unwrap_or_else(|err| panic!("invalid provenance configuration: {err}"));
-        Fetcher {
+            .map_err(|err| FetchError::Http(format!("invalid provenance configuration: {err}")))?;
+        if !receipts.is_shared_durable() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "receipt_store_single_replica",
+                    "durable": false,
+                })
+            );
+        }
+        Ok(Fetcher {
             spider,
             provenance,
-            receipts: Mutex::new(HashMap::new()),
-            receipt_counter: AtomicU64::new(1),
-        }
-    }
-
-    pub async fn product_fetch(
-        &self,
-        payload: ProductRequest,
-        route: ProductRoute,
-    ) -> Result<ProductResponse, FetchError> {
-        self.product_fetch_with_auth(payload, route, None).await
+            receipts,
+        })
     }
 
     pub async fn product_fetch_with_auth(
@@ -64,7 +70,15 @@ impl Fetcher {
     ) -> Result<ProductResponse, FetchError> {
         payload.validate_for(route)?;
         let mode = self.resolve_mode(payload.mode, route);
-        let timeout_secs = payload.timeout_secs.unwrap_or_else(|| match mode {
+        let should_receipt = payload.receipt.unwrap_or(matches!(
+            mode,
+            ProductMode::Auto | ProductMode::Fast | ProductMode::Extract
+        ));
+        let receipt_owner = should_receipt
+            .then(|| ReceiptOwner::from_auth_context(auth_context))
+            .transpose()
+            .map_err(|err| FetchError::Http(err.to_string()))?;
+        let timeout_secs = payload.timeout_secs.unwrap_or(match mode {
             ProductMode::Unblock => 50,
             ProductMode::Browser | ProductMode::Crawl | ProductMode::Screenshot => 45,
             _ => 25,
@@ -105,23 +119,23 @@ impl Fetcher {
         };
 
         let data = Self::ensure_spider_success(data)?;
-        let should_receipt = payload.receipt.unwrap_or(matches!(
-            mode,
-            ProductMode::Auto | ProductMode::Fast | ProductMode::Extract
-        ));
         let (receipt_id, receipt) = if should_receipt {
             let source = payload
                 .source
                 .as_deref()
                 .or(payload.query.as_deref())
                 .unwrap_or("unknown");
+            let owner = receipt_owner
+                .as_ref()
+                .ok_or_else(|| FetchError::Http("receipt owner was not resolved".to_string()))?;
             let receipt = self.store_receipt(
+                owner,
                 source,
                 &data,
                 mode.receipt_label(),
                 Self::request_type_name(mode),
                 Self::proxy_name(&payload, mode),
-            );
+            )?;
             (Some(receipt.id.clone()), Some(receipt))
         } else {
             (None, None)
@@ -140,14 +154,6 @@ impl Fetcher {
             provenance,
             provenance_error,
         })
-    }
-
-    pub async fn get_fast_data_with_receipt(
-        &self,
-        source: &str,
-    ) -> Result<FetchWithReceipt, FetchError> {
-        self.get_fast_data_with_receipt_with_auth(source, None)
-            .await
     }
 
     pub async fn get_fast_data_with_receipt_with_auth(
@@ -198,7 +204,17 @@ impl Fetcher {
         })
     }
 
-    pub async fn snapshot_with_receipt(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
+    pub async fn snapshot_with_receipt_with_auth(
+        &self,
+        source: &str,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<SnapshotPayload, FetchError> {
+        let owner = ReceiptOwner::from_auth_context(auth_context)
+            .map_err(|err| FetchError::Http(err.to_string()))?;
+        let mut payload = ProductRequest::fast(source);
+        payload.mode = ProductMode::Screenshot;
+        payload.formats = Some(vec![ProductFormat::Raw, ProductFormat::Screenshot]);
+        payload.receipt = Some(true);
         let formats = HashSet::from([ReturnFormat::Raw, ReturnFormat::Screenshot]);
         let params = RequestParams {
             return_format: Some(ReturnFormatHandling::Multi(formats)),
@@ -214,24 +230,35 @@ impl Fetcher {
             .scrape_url(source, Some(params), "application/json")
             .await
             .map_err(FetchError::UnableFetch)?;
-        let crawl = Self::normalize_value(data)?;
+        let crawl = Self::ensure_spider_success(Self::normalize_value(data)?)?;
+        SnapshotPayload::validate_spider_response(&crawl).map_err(FetchError::Snapshot)?;
+        let receipt = self.store_receipt(
+            &owner,
+            source,
+            &crawl,
+            ProductMode::Screenshot.receipt_label(),
+            Self::request_type_name(ProductMode::Screenshot),
+            Self::proxy_name(&payload, ProductMode::Screenshot),
+        )?;
+        let (provenance, provenance_error) = self
+            .provenance_for(
+                &payload,
+                ProductRoute::Screenshot,
+                ProductMode::Screenshot,
+                &crawl,
+                Some(&receipt),
+                auth_context,
+            )
+            .await;
 
-        SnapshotPayload::from_spider_response(source, crawl).map_err(FetchError::Snapshot)
-    }
-
-    pub async fn unblocker(&self, source: &str) -> Result<serde_json::Value, FetchError> {
-        let mut payload = ProductRequest::fast(source);
-        payload.mode = ProductMode::Unblock;
-        payload.timeout_secs = Some(50);
-        payload.request_timeout_secs = Some(30);
-        payload.crawl_timeout_secs = Some(45);
-        payload.stealth = Some(true);
-        payload.fingerprint = Some(true);
-        payload.scroll = Some(1);
-        payload.receipt = Some(false);
-        self.product_fetch(payload, ProductRoute::Unblock)
-            .await
-            .map(|response| response.data)
+        SnapshotPayload::from_spider_response(
+            source,
+            receipt.id,
+            crawl,
+            provenance,
+            provenance_error,
+        )
+        .map_err(FetchError::Snapshot)
     }
 
     async fn provenance_for(
@@ -461,7 +488,7 @@ impl Fetcher {
                     .fingerprint
                     .unwrap_or(matches!(mode, ProductMode::Unblock)),
             ),
-            scroll: payload.scroll.or_else(|| {
+            scroll: payload.scroll.or({
                 if matches!(mode, ProductMode::Unblock) {
                     Some(1)
                 } else {
@@ -660,22 +687,28 @@ impl Fetcher {
         Ok(value)
     }
 
-    pub fn get_receipt(&self, id: &str) -> Option<Receipt> {
+    pub fn get_receipt(
+        &self,
+        id: &str,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<Option<Receipt>, FetchError> {
+        let owner = ReceiptOwner::from_auth_context(auth_context)
+            .map_err(|err| FetchError::Http(err.to_string()))?;
         self.receipts
-            .lock()
-            .ok()
-            .and_then(|receipts| receipts.get(id).cloned())
+            .get(&owner, id)
+            .map_err(|err| FetchError::Http(err.to_string()))
     }
 
     fn store_receipt(
         &self,
+        owner: &ReceiptOwner,
         source: &str,
         value: &Value,
         mode: &str,
         request_type: &str,
         proxy: Option<&str>,
-    ) -> Receipt {
-        let id = self.next_receipt_id();
+    ) -> Result<Receipt, FetchError> {
+        let id = new_receipt_id();
         let first = value.as_array().and_then(|items| items.first());
         let status = first
             .and_then(|item| item.get("status"))
@@ -712,16 +745,11 @@ impl Fetcher {
             demo_message: "amazing job".to_string(),
         };
 
-        if let Ok(mut receipts) = self.receipts.lock() {
-            receipts.insert(receipt.id.clone(), receipt.clone());
-        }
+        self.receipts
+            .put(owner, receipt.clone())
+            .map_err(|err| FetchError::Http(err.to_string()))?;
 
-        receipt
-    }
-
-    fn next_receipt_id(&self) -> String {
-        let sequence = self.receipt_counter.fetch_add(1, Ordering::Relaxed);
-        format!("{:x}-{:x}", Self::now_unix_ms(), sequence)
+        Ok(receipt)
     }
 
     fn now_unix_ms() -> u128 {
@@ -732,6 +760,10 @@ impl Fetcher {
     }
 }
 
+fn new_receipt_id() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
 /// Parse product search engine strings.
 fn parse_engine(engine: &str) -> Option<Engine> {
     match engine.to_ascii_lowercase().as_str() {
@@ -739,5 +771,20 @@ fn parse_engine(engine: &str) -> Option<Engine> {
         "brave" => Some(Engine::Brave),
         "all" => Some(Engine::All),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_receipt_id;
+
+    #[test]
+    fn receipt_ids_are_random_uuid_values() {
+        let first = new_receipt_id();
+        let second = new_receipt_id();
+
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 }

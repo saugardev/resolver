@@ -3,10 +3,7 @@
 use crate::auth::ResolverAuthContext;
 use crate::errors::ResolverCreditsError;
 use livy_provenance_sdk::DEFAULT_LIVY_API_BASE_URL;
-use reqwest::{
-    StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
-};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -31,6 +28,12 @@ pub struct ResolverCreditDebitOutcome {
     pub enforced: bool,
     pub charged: bool,
     pub amount: i64,
+}
+
+impl ResolverCreditDebitOutcome {
+    pub fn permits_work(&self) -> bool {
+        self.enforced || self.mode == "idempotent_replay"
+    }
 }
 
 impl ResolverCreditsClient {
@@ -74,6 +77,7 @@ impl ResolverCreditsClient {
         route: &str,
         source_url: Option<&str>,
         subject_id: Option<&str>,
+        requested_idempotency_key: Option<&str>,
     ) -> Result<Option<ResolverCreditDebitOutcome>, ResolverCreditsError> {
         self.debit_request(
             auth_context,
@@ -82,7 +86,7 @@ impl ResolverCreditsClient {
                 route,
                 source_url,
                 subject_id,
-                requested_idempotency_key: None,
+                requested_idempotency_key,
                 metadata: json!({
                     "product_route": route,
                 }),
@@ -107,8 +111,12 @@ impl ResolverCreditsClient {
             .tenant_id
             .as_deref()
             .ok_or(ResolverCreditsError::MissingAuth("tenant_id"))?;
-        let project_id = auth_context.project_id.as_deref();
+        let project_id = auth_context
+            .project_id
+            .as_deref()
+            .ok_or(ResolverCreditsError::MissingAuth("project_id"))?;
         let idempotency_key = resolver_request_idempotency_key(&request, auth_context);
+        let amount = resolver_route_credit_amount_from_env(request.route, self.amount);
         let source_sha256 = request
             .source_url
             .map(|source_url| sha256_hex(source_url.as_bytes()));
@@ -133,7 +141,7 @@ impl ResolverCreditsClient {
             .post(self.endpoint(tenant_id))
             .headers(self.headers(access_token)?)
             .json(&json!({
-                "amount": self.amount,
+                "amount": amount,
                 "project_id": project_id,
                 "idempotency_key": idempotency_key,
                 "reason": request.reason,
@@ -191,7 +199,18 @@ fn resolver_request_idempotency_key(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return format!("resolver_{}:{requested}", key_segment(request.route));
+        let material = json!({
+            "tenant_id": auth_context.tenant_id.as_deref(),
+            "project_id": auth_context.project_id.as_deref(),
+            "client_id": auth_context.client_id.as_deref(),
+            "route": request.route,
+            "requested_idempotency_key": requested,
+        });
+        return format!(
+            "resolver_{}:{}",
+            key_segment(request.route),
+            sha256_hex(material.to_string().as_bytes())
+        );
     }
 
     let nonce = SystemTime::now()
@@ -246,6 +265,22 @@ fn resolver_request_credit_amount_from_env() -> i64 {
         .unwrap_or(1)
 }
 
+fn resolver_route_credit_amount_from_env(route: &str, default: i64) -> i64 {
+    env_i64(&route_credit_cost_env_name(route)).unwrap_or(default)
+}
+
+fn route_credit_cost_env_name(route: &str) -> String {
+    let suffix = route
+        .chars()
+        .map(|character| match character {
+            'a'..='z' => character.to_ascii_uppercase(),
+            'A'..='Z' | '0'..='9' => character,
+            _ => '_',
+        })
+        .collect::<String>();
+    format!("LIVY_RESOLVER_CREDIT_COST_{suffix}")
+}
+
 fn env_bool(name: &str) -> Option<bool> {
     optional_env(name).and_then(|value| match value.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -279,6 +314,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::Path, http::HeaderMap as AxumHeaderMap, routing::post};
+    use reqwest::StatusCode;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn idempotency_key_uses_client_supplied_value_when_present() {
@@ -303,8 +341,160 @@ mod tests {
                 },
                 &auth,
             ),
-            "resolver_mcp_fetch_source:request-1"
+            format!(
+                "resolver_mcp_fetch_source:{}",
+                sha256_hex(
+                    json!({
+                        "tenant_id": "tenant-a",
+                        "project_id": "project-a",
+                        "client_id": "client",
+                        "route": "mcp.fetch_source",
+                        "requested_idempotency_key": "request-1",
+                    })
+                    .to_string()
+                    .as_bytes()
+                )
+            )
         );
+    }
+
+    #[test]
+    fn caller_key_is_scoped_to_tenant_project_and_route() {
+        let mut auth = ResolverAuthContext {
+            access_token: Some("token".to_string()),
+            client_id: Some("client".to_string()),
+            scopes: vec![],
+            audiences: vec![],
+            tenant_id: Some("tenant-a".to_string()),
+            project_id: Some("project-a".to_string()),
+        };
+        let request = ResolverCreditRequest {
+            reason: "resolver.product_request",
+            route: "fetch",
+            source_url: Some("https://example.com"),
+            subject_id: None,
+            requested_idempotency_key: Some("retry-1"),
+            metadata: json!({}),
+        };
+        let first = resolver_request_idempotency_key(&request, &auth);
+        assert_eq!(first, resolver_request_idempotency_key(&request, &auth));
+
+        auth.project_id = Some("project-b".to_string());
+        assert_ne!(first, resolver_request_idempotency_key(&request, &auth));
+    }
+
+    #[test]
+    fn only_enforced_or_idempotent_replay_outcomes_permit_work() {
+        let outcome = |mode: &str, enforced| ResolverCreditDebitOutcome {
+            mode: mode.to_string(),
+            enforced,
+            charged: false,
+            amount: 1,
+        };
+
+        assert!(outcome("charged", true).permits_work());
+        assert!(outcome("idempotent_replay", false).permits_work());
+        assert!(!outcome("advisory", false).permits_work());
+    }
+
+    #[test]
+    fn route_credit_costs_have_independent_stable_keys() {
+        assert_eq!(
+            route_credit_cost_env_name("fetch"),
+            "LIVY_RESOLVER_CREDIT_COST_FETCH"
+        );
+        assert_eq!(
+            route_credit_cost_env_name("mcp.fetch_source"),
+            "LIVY_RESOLVER_CREDIT_COST_MCP_FETCH_SOURCE"
+        );
+    }
+
+    #[tokio::test]
+    async fn product_debit_sends_scoped_idempotency_and_project_context() {
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_handler = captured.clone();
+        let app = Router::new().route(
+            "/api/v1/tenants/{tenant_id}/users/me/credits/debits",
+            post(
+                move |Path(tenant_id): Path<String>,
+                      headers: AxumHeaderMap,
+                      Json(body): Json<serde_json::Value>| {
+                    let captured = captured_for_handler.clone();
+                    async move {
+                        *captured.lock().expect("capture lock") = Some(json!({
+                            "tenant_id": tenant_id,
+                            "authorization": headers
+                                .get(AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok()),
+                            "body": body,
+                        }));
+                        Json(json!({
+                            "mode": "charged",
+                            "enforced": true,
+                            "charged": true,
+                            "amount": 7,
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = ResolverCreditsClient {
+            enabled: true,
+            backend_base_url: format!("http://{address}"),
+            amount: 7,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        };
+        let auth = ResolverAuthContext {
+            access_token: Some("oauth-token".to_string()),
+            client_id: Some("client-a".to_string()),
+            scopes: vec!["resolver:source:fetch".to_string()],
+            audiences: vec!["resolver".to_string()],
+            tenant_id: Some("tenant-a".to_string()),
+            project_id: Some("project-a".to_string()),
+        };
+        let outcome = client
+            .debit_product_request(
+                &auth,
+                "integration_test",
+                Some("https://example.com"),
+                None,
+                Some("retry-1"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.permits_work());
+
+        let expected_key = resolver_request_idempotency_key(
+            &ResolverCreditRequest {
+                reason: "resolver.product_request",
+                route: "integration_test",
+                source_url: Some("https://example.com"),
+                subject_id: None,
+                requested_idempotency_key: Some("retry-1"),
+                metadata: json!({}),
+            },
+            &auth,
+        );
+        let request = captured
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("request was captured");
+        assert_eq!(request["tenant_id"], "tenant-a");
+        assert_eq!(request["authorization"], "Bearer oauth-token");
+        assert_eq!(request["body"]["project_id"], "project-a");
+        assert_eq!(request["body"]["amount"], 7);
+        assert_eq!(request["body"]["idempotency_key"], expected_key);
+
+        server.abort();
     }
 
     #[test]

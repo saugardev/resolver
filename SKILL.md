@@ -65,7 +65,7 @@ provenance:
 
 - `attestation_claim=source`
 - `subject_type=resolver_fetch`
-- `schema_id=resolver-fetch-v1`
+- `schema_id=resolver-fetch-v2` (commitment-only source schema)
 - `integration_id=delphi` by default
 
 Do not use the `prediction_market_resolver` template unless the resolver
@@ -91,13 +91,15 @@ Optional:
 
 ```dotenv
 LIVY_API_KEY=livy_...
-LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v1
-LIVY_PROVENANCE_SCHEMA_VERSION=1
-LIVY_PROVENANCE_VISIBILITY=public
+LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v2
+LIVY_PROVENANCE_SCHEMA_VERSION=2
+LIVY_PROVENANCE_VISIBILITY=private
 LIVY_PROVENANCE_VERIFICATION_MODE=verify_fresh
 LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
-LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=true
+LIVY_PROVENANCE_MANAGED_PUBLICATION=false
+LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false
+LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=false
 LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES=262144
 ```
 
@@ -112,9 +114,11 @@ request/response exchange as `resolver-response.json`. The
 `request`, the exact upstream JSON as `response`, and both SHA-256 commitments.
 Header and cookie values remain redacted. Oversized exchanges stay
 commitment-only, and `LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false` disables
-response reveals. Response reveals default on for public provenance and off for
-private provenance. Arweave publication is public and irreversible, so use it
-only for outputs that are safe to disclose.
+response reveals. Response reveals and managed publication default off, while
+the source URL is committed rather than public. Public visibility or managed
+publication also requires
+`LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=true`. Arweave publication is public
+and irreversible, so use it only for outputs that are safe to disclose.
 
 ## MCP Use
 

@@ -3,7 +3,7 @@
 use axum::{
     Json,
     extract::{Extension, FromRequest, Path, Request, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 
@@ -12,11 +12,10 @@ use crate::credits::ResolverCreditsClient;
 use crate::errors::FetchError;
 use crate::fetch::Fetcher;
 use crate::types::{
-    FetchWithReceipt, ProductRequest, ProductResponse, ProductRoute, Receipt, validate_receipt_id,
-    validate_source_url,
+    FetchWithReceipt, ProductRequest, ProductResponse, ProductRoute, Receipt,
+    validate_idempotency_key, validate_receipt_id, validate_source_url,
 };
 use serde::Deserialize;
-use serde_json::Value;
 use std::sync::Arc;
 
 pub struct ApiJson<T>(pub T);
@@ -73,15 +72,18 @@ pub async fn fetch_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Scrape)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         ProductRoute::Scrape.as_str(),
         payload.source.as_deref(),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
     let data = fetcher
@@ -94,15 +96,18 @@ pub async fn crawl_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Crawl)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         ProductRoute::Crawl.as_str(),
         payload.source.as_deref(),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
     let data = fetcher
@@ -115,15 +120,18 @@ pub async fn map_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Map)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         ProductRoute::Map.as_str(),
         payload.source.as_deref(),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
     let data = fetcher
@@ -136,15 +144,18 @@ pub async fn search_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Search)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         ProductRoute::Search.as_str(),
         None,
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
     let data = fetcher
@@ -157,15 +168,18 @@ pub async fn extract_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Extract)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         ProductRoute::Extract.as_str(),
         payload.source.as_deref(),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
     let data = fetcher
@@ -178,15 +192,18 @@ pub async fn screenshot_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Screenshot)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         ProductRoute::Screenshot.as_str(),
         payload.source.as_deref(),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
     let data = fetcher
@@ -199,18 +216,23 @@ pub async fn fetch_fast(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<FetchWithReceipt>, FetchError> {
     validate_source_url(&payload.source)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         "fetchfast",
         Some(&payload.source),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
-    let data = fetcher.get_fast_data_with_receipt(&payload.source).await?;
+    let data = fetcher
+        .get_fast_data_with_receipt_with_auth(&payload.source, Some(&auth_context))
+        .await?;
     Ok(Json(data))
 }
 
@@ -219,11 +241,21 @@ pub async fn get_receipt(
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Receipt>, FetchError> {
     validate_receipt_id(&id)?;
-    debit_product_route(&credits, &auth_context, "receipt", None, Some(&id)).await?;
+    let idempotency_key = request_idempotency_key(&headers)?;
+    debit_product_route(
+        &credits,
+        &auth_context,
+        "receipt",
+        None,
+        Some(&id),
+        idempotency_key.as_deref(),
+    )
+    .await?;
     fetcher
-        .get_receipt(&id)
+        .get_receipt(&id, Some(&auth_context))?
         .map(Json)
         .ok_or_else(|| FetchError::NotFound(format!("Receipt not found: {id}")))
 }
@@ -232,18 +264,23 @@ pub async fn snapshot_source(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<crate::snapshot_upload::SnapshotPayload>, FetchError> {
     validate_source_url(&payload.source)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         "snapshot",
         Some(&payload.source),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
-    let snapshot = fetcher.snapshot_with_receipt(&payload.source).await?;
+    let snapshot = fetcher
+        .snapshot_with_receipt_with_auth(&payload.source, Some(&auth_context))
+        .await?;
     Ok(Json(snapshot))
 }
 
@@ -252,18 +289,23 @@ pub async fn fetch_unblock(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    headers: HeaderMap,
     ApiJson(payload): ApiJson<FetchRequest>,
-) -> Result<Json<Value>, FetchError> {
+) -> Result<Json<FetchWithReceipt>, FetchError> {
     validate_source_url(&payload.source)?;
+    let idempotency_key = request_idempotency_key(&headers)?;
     debit_product_route(
         &credits,
         &auth_context,
         "fetchunblock",
         Some(&payload.source),
         None,
+        idempotency_key.as_deref(),
     )
     .await?;
-    let data = fetcher.unblocker(&payload.source).await?;
+    let data = fetcher
+        .get_unblock_data_with_receipt_with_auth(&payload.source, Some(&auth_context))
+        .await?;
     Ok(Json(data))
 }
 
@@ -273,9 +315,16 @@ async fn debit_product_route(
     route: &str,
     source_url: Option<&str>,
     subject_id: Option<&str>,
+    requested_idempotency_key: Option<&str>,
 ) -> Result<(), FetchError> {
     match credits
-        .debit_product_request(auth_context, route, source_url, subject_id)
+        .debit_product_request(
+            auth_context,
+            route,
+            source_url,
+            subject_id,
+            requested_idempotency_key,
+        )
         .await
     {
         Ok(Some(outcome)) => {
@@ -294,7 +343,13 @@ async fn debit_product_route(
                     "enforced": outcome.enforced,
                 })
             );
-            Ok(())
+            if outcome.permits_work() {
+                Ok(())
+            } else {
+                Err(FetchError::Credits(
+                    "credit debit response did not enforce the request".to_string(),
+                ))
+            }
         }
         Ok(None) => {
             eprintln!(
@@ -312,5 +367,46 @@ async fn debit_product_route(
         }
         Err(err) if err.is_payment_required() => Err(FetchError::PaymentRequired(err.to_string())),
         Err(err) => Err(FetchError::Credits(err.to_string())),
+    }
+}
+
+fn request_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, FetchError> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(FetchError::BadRequest(
+            "Idempotency-Key must be sent at most once".to_string(),
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        FetchError::BadRequest("Idempotency-Key must contain valid ASCII".to_string())
+    })?;
+    validate_idempotency_key(Some(value))?;
+    Ok(Some(value.trim().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn idempotency_header_is_validated_and_normalized() {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static("retry-123"));
+        assert_eq!(
+            request_idempotency_key(&headers).unwrap().as_deref(),
+            Some("retry-123")
+        );
+
+        headers.insert("idempotency-key", HeaderValue::from_static("bad key"));
+        assert!(request_idempotency_key(&headers).is_err());
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("idempotency-key", HeaderValue::from_static("one"));
+        duplicate.append("idempotency-key", HeaderValue::from_static("two"));
+        assert!(request_idempotency_key(&duplicate).is_err());
     }
 }

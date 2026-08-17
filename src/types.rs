@@ -14,11 +14,12 @@ const MAX_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// High-level route behavior exposed to API clients.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductMode {
     /// Let the service choose the default SmartMode path.
     #[serde(alias = "smart", alias = "smart_mode")]
+    #[default]
     Auto,
     /// Use the fast SmartMode + ISP proxy source-fetch path.
     Fast,
@@ -38,12 +39,6 @@ pub enum ProductMode {
     Extract,
     /// Return a page screenshot payload.
     Screenshot,
-}
-
-impl Default for ProductMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl ProductMode {
@@ -585,7 +580,7 @@ impl ProductRoute {
     }
 }
 
-/// In-memory provenance metadata for receipt-backed requests.
+/// Resolver metadata for a tenant-owned receipt-backed request.
 #[derive(Clone, Debug, Serialize)]
 pub struct Receipt {
     /// Receipt identifier.

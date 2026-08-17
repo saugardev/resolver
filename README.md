@@ -46,7 +46,7 @@ fetch. This branch records generic resolver source-fetch proofs with:
 
 - `attestation_claim=source`
 - `subject_type=resolver_fetch`
-- `schema_id=resolver-fetch-v1`
+- `schema_id=resolver-fetch-v2` (commitment-only source schema)
 - `integration_id=delphi` by default
 
 This is intentionally not the `prediction_market_resolver` template. Use
@@ -74,21 +74,25 @@ Optional settings:
 
 ```dotenv
 LIVY_API_KEY=livy_...
-LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v1
-LIVY_PROVENANCE_SCHEMA_VERSION=1
-LIVY_PROVENANCE_VISIBILITY=public
+LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v2
+LIVY_PROVENANCE_SCHEMA_VERSION=2
+LIVY_PROVENANCE_VISIBILITY=private
 LIVY_PROVENANCE_VERIFICATION_MODE=verify_fresh
 LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
-LIVY_PROVENANCE_MANAGED_PUBLICATION=true
-LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=true
+LIVY_PROVENANCE_MANAGED_PUBLICATION=false
+LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false
+LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=false
 LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES=262144
 LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=false
 LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS=30
 LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS=2000
 ```
 
-`LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local or staging backends.
+`LIVY_PROVENANCE_ENABLED=true` is the only setting that activates provenance;
+shared backend URLs and service credentials never activate it implicitly.
+`LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local
+or staging backends.
 
 `LIVY_API_KEY` is only used for legacy/local service-key provenance writes.
 Production service-key writes are disabled unless
@@ -110,9 +114,12 @@ the request summary records only their presence or count. Artifacts larger than
 `LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES` remain commitment-only so an
 oversized reveal cannot block receipt publication. Set
 `LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false` to keep every response
-commitment-only. Response artifacts default on for public provenance and off
-for private provenance. Managed publication is public and irreversible, so
-enable it only for resolver outputs that are safe to disclose. The resolver
+commitment-only. Response artifacts and managed publication default off, and
+the source URL is a commitment field rather than a public value. Public
+visibility or managed publication additionally requires the explicit
+`LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=true` acknowledgement. Managed
+publication is public and irreversible, so enable it only for resolver outputs
+that are safe to disclose. The resolver
 still returns the attestation immediately. Set
 `LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=true` only when the caller should wait
 for public `registry_refs`; that mode requires the API key to have provenance
@@ -132,7 +139,7 @@ Response shape:
   "provenance": {
     "provenance_attestation_id": "...",
     "subject_id": "resolver_fetch:...",
-    "schema_id": "resolver-fetch-v1",
+    "schema_id": "resolver-fetch-v2",
     "verification_status": "verified",
     "schema_binding_status": "full",
     "explorer_url": "...",
@@ -159,6 +166,27 @@ Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|cr
 | GET | `/receipt/{id}` | Read receipt |
 
 Prefer `/fetch` with `mode` over the compat routes.
+
+Send one validated `Idempotency-Key` header on product requests and reuse it
+only when retrying the same logical request. The resolver scopes and hashes the
+key with the authenticated tenant, project, client, and route before sending it
+to the credit service. Credit responses that are neither enforced nor an
+idempotent replay fail closed before Spider is called.
+`LIVY_RESOLVER_REQUEST_CREDIT_COST` is the default price; deployments can set
+route-specific overrides such as `LIVY_RESOLVER_CREDIT_COST_CRAWL`,
+`LIVY_RESOLVER_CREDIT_COST_SCREENSHOT`, and
+`LIVY_RESOLVER_CREDIT_COST_MCP_FETCH_SOURCE`. The debit happens before the
+upstream attempt and this service does not automatically refund failed
+upstream attempts; any refund policy must be implemented by the billing
+backend.
+
+Receipt identifiers are random and lookup is scoped to the authenticated
+tenant and project. The default in-memory store expires records after 15
+minutes and keeps at most 10,000 records. It is not durable or replica-shared,
+so production refuses it unless
+`LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true` explicitly acknowledges a
+single-replica exception. Deployments should inject a shared durable
+`ReceiptStore` implementation.
 
 ## API security
 

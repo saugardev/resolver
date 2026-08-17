@@ -150,8 +150,8 @@ impl Server {
         description = "Fetch the exact source URL supplied by the user using adaptive resolver routing. Use this whenever the prompt contains a source URL, `source: <url>`, `only take this source`, or says the URL is the source of truth. Do not perform web search or substitute another article.",
         annotations(
             title = "Fetch Source",
-            read_only_hint = true,
-            destructive_hint = false,
+            read_only_hint = false,
+            destructive_hint = true,
             open_world_hint = true
         ),
         meta = "fetch_source_tool_meta()"
@@ -209,6 +209,20 @@ impl Server {
                         "enforced": outcome.enforced,
                     })
                 );
+                if !outcome.permits_work() {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "mcp_credit_debit_not_enforced",
+                            "request_id": crate::security::current_request_id(),
+                            "source_sha256": &source_sha256,
+                            "mode": outcome.mode,
+                        })
+                    );
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Livy credit authorization was not enforced",
+                    )]));
+                }
             }
             Ok(None) => {
                 eprintln!(
@@ -533,11 +547,11 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
                 let ui = meta_object
                     .entry("ui".to_string())
                     .or_insert_with(|| json!({}));
-                if let Some(ui_object) = ui.as_object_mut() {
-                    if !ui_object.contains_key("visibility") {
-                        ui_object.insert("visibility".to_string(), chatgpt_tool_visibility());
-                        changed = true;
-                    }
+                if let Some(ui_object) = ui.as_object_mut()
+                    && !ui_object.contains_key("visibility")
+                {
+                    ui_object.insert("visibility".to_string(), chatgpt_tool_visibility());
+                    changed = true;
                 }
                 if !meta_object.contains_key("securitySchemes") {
                     meta_object.insert(
@@ -1006,13 +1020,13 @@ mod tests {
             tool.annotations
                 .as_ref()
                 .and_then(|annotations| annotations.read_only_hint),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             tool.annotations
                 .as_ref()
                 .and_then(|annotations| annotations.destructive_hint),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             tool.annotations

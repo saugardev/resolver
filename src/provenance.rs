@@ -24,9 +24,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_SCHEMA_ID: &str = "resolver-fetch-v1";
-const DEFAULT_SCHEMA_VERSION: &str = "1";
+const DEFAULT_SCHEMA_ID: &str = "resolver-fetch-v2";
+const DEFAULT_SCHEMA_VERSION: &str = "2";
 const DEFAULT_INTEGRATION_ID: &str = "delphi";
+const DEFAULT_VISIBILITY: &str = "private";
+const DEFAULT_MANAGED_PUBLICATION: bool = false;
+const DEFAULT_PUBLISH_RESPONSE_ARTIFACT: bool = false;
 const APPLICATION_DOMAIN: &str = "resolver";
 const SUBJECT_TYPE: &str = "resolver_fetch";
 const ATTESTATION_CLAIM: &str = "source";
@@ -160,12 +163,22 @@ struct ResolverResponseArtifactCommitments<'a> {
     response_sha256: &'a str,
 }
 
+struct ProvenanceSchemaValues<'a> {
+    subject_id: &'a str,
+    input_commitment: &'a Value,
+    output_commitment: &'a Value,
+    source: &'a str,
+    route: ProductRoute,
+    mode: ProductMode,
+    fetched_at_unix_ms: u64,
+    receipt_id: Option<&'a str>,
+}
+
 impl ProvenanceClient {
     pub fn from_env() -> Result<Option<Self>, ProvenanceError> {
-        let configured = env_present("LIVY_BACKEND_BASE_URL")
-            || env_present("LIVY_API_KEY")
-            || env_present("LIVY_PROVENANCE_ENABLED");
-        let enabled = env_bool("LIVY_PROVENANCE_ENABLED")?.unwrap_or(configured);
+        // Backend and service credentials are shared by billing and other Livy
+        // integrations. They must never activate provenance as a side effect.
+        let enabled = explicit_provenance_enabled(env_bool("LIVY_PROVENANCE_ENABLED")?);
 
         if !enabled {
             return Ok(None);
@@ -176,16 +189,19 @@ impl ProvenanceClient {
         let integration_id = env_or("LIVY_INTEGRATION_ID", DEFAULT_INTEGRATION_ID);
         let schema_id = env_or("LIVY_PROVENANCE_SCHEMA_ID", DEFAULT_SCHEMA_ID);
         let schema_version = env_or("LIVY_PROVENANCE_SCHEMA_VERSION", DEFAULT_SCHEMA_VERSION);
-        let visibility = env_or("LIVY_PROVENANCE_VISIBILITY", "public");
+        let visibility = env_or("LIVY_PROVENANCE_VISIBILITY", DEFAULT_VISIBILITY);
         let verification_mode =
             parse_verification_mode(&env_or("LIVY_PROVENANCE_VERIFICATION_MODE", "verify_fresh"))?;
         let subject_prefix = env_or("LIVY_PROVENANCE_SUBJECT_PREFIX", SUBJECT_TYPE);
         let explorer_base_url = optional_env("LIVY_EXPLORER_BASE_URL");
         let program_id = optional_env("LIVY_RESOLVER_PROGRAM_ID");
         let bootstrap_template = env_bool("LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE")?.unwrap_or(false);
-        let managed_publication = env_bool("LIVY_PROVENANCE_MANAGED_PUBLICATION")?.unwrap_or(true);
+        let managed_publication =
+            env_bool("LIVY_PROVENANCE_MANAGED_PUBLICATION")?.unwrap_or(DEFAULT_MANAGED_PUBLICATION);
         let publish_response_artifact = env_bool("LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT")?
-            .unwrap_or(visibility == "public");
+            .unwrap_or(DEFAULT_PUBLISH_RESPONSE_ARTIFACT);
+        let public_disclosure_allowed =
+            env_bool("LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE")?.unwrap_or(false);
         let response_artifact_max_bytes = env_usize("LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES")?
             .unwrap_or(DEFAULT_RESPONSE_ARTIFACT_MAX_BYTES);
         let wait_for_registry_refs =
@@ -202,6 +218,12 @@ impl ProvenanceClient {
                 "LIVY_PROVENANCE_VISIBILITY must be public or private".to_string(),
             ));
         }
+        validate_publication_policy(
+            &visibility,
+            managed_publication,
+            publish_response_artifact,
+            public_disclosure_allowed,
+        )?;
 
         let livy = Livy::from_env().map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
         let api = api_key
@@ -297,7 +319,7 @@ impl ProvenanceClient {
             .commit(&subject_id)
             .commit_hashed(&input_commitment)
             .commit_hashed(&output_commitment)
-            .commit(&source)
+            .commit_hashed(&source)
             .commit(&evidence.route.as_str())
             .commit(&mode_label(evidence.mode))
             .commit(&fetched_at_unix_ms);
@@ -313,16 +335,16 @@ impl ProvenanceClient {
             .finalize()
             .await
             .map_err(|err| ProvenanceError::Attestation(err.to_string()))?;
-        let fields = self.schema_fields(
-            &subject_id,
-            &input_commitment,
-            &output_commitment,
-            &source,
-            evidence.route,
-            evidence.mode,
+        let fields = self.schema_fields(ProvenanceSchemaValues {
+            subject_id: &subject_id,
+            input_commitment: &input_commitment,
+            output_commitment: &output_commitment,
+            source: &source,
+            route: evidence.route,
+            mode: evidence.mode,
             fetched_at_unix_ms,
-            receipt_id.as_deref(),
-        );
+            receipt_id: receipt_id.as_deref(),
+        });
 
         let request = CreateProvenanceAttestationRequest {
             attestation_claim: ATTESTATION_CLAIM.to_string(),
@@ -546,17 +568,7 @@ impl ProvenanceClient {
         Ok(format!("{}:{}", self.config.subject_prefix, &digest[..24]))
     }
 
-    fn schema_fields(
-        &self,
-        subject_id: &str,
-        input_commitment: &Value,
-        output_commitment: &Value,
-        source: &str,
-        route: ProductRoute,
-        mode: ProductMode,
-        fetched_at_unix_ms: u64,
-        receipt_id: Option<&str>,
-    ) -> Vec<ProvenanceAttestationField> {
+    fn schema_fields(&self, values: ProvenanceSchemaValues<'_>) -> Vec<ProvenanceAttestationField> {
         let mut fields = vec![
             schema_field(
                 0,
@@ -569,47 +581,53 @@ impl ProvenanceClient {
                 1,
                 "subject_id",
                 ProvenanceCommitMode::Json,
-                json!(subject_id),
+                json!(values.subject_id),
                 true,
             ),
             schema_field(
                 2,
                 "input_commitment",
                 ProvenanceCommitMode::JsonSha256,
-                input_commitment.clone(),
+                values.input_commitment.clone(),
                 true,
             ),
             schema_field(
                 3,
                 "output_commitment",
                 ProvenanceCommitMode::JsonSha256,
-                output_commitment.clone(),
+                values.output_commitment.clone(),
                 true,
             ),
-            schema_field(4, "source", ProvenanceCommitMode::Json, json!(source), true),
+            schema_field(
+                4,
+                "source",
+                ProvenanceCommitMode::JsonSha256,
+                json!(values.source),
+                true,
+            ),
             schema_field(
                 5,
                 "route",
                 ProvenanceCommitMode::Json,
-                json!(route.as_str()),
+                json!(values.route.as_str()),
                 true,
             ),
             schema_field(
                 6,
                 "mode",
                 ProvenanceCommitMode::Json,
-                json!(mode_label(mode)),
+                json!(mode_label(values.mode)),
                 true,
             ),
             schema_field(
                 7,
                 "fetched_at_unix_ms",
                 ProvenanceCommitMode::Json,
-                json!(fetched_at_unix_ms),
+                json!(values.fetched_at_unix_ms),
                 true,
             ),
         ];
-        if let Some(receipt_id) = receipt_id {
+        if let Some(receipt_id) = values.receipt_id {
             fields.push(schema_field(
                 8,
                 "receipt_id",
@@ -659,6 +677,9 @@ impl ProvenanceClient {
     }
 
     fn explorer_url(&self, provenance_attestation_id: &str) -> Option<String> {
+        if self.config.visibility != "public" {
+            return None;
+        }
         let base = self
             .config
             .explorer_base_url
@@ -936,11 +957,11 @@ fn resolver_template_fields() -> Vec<ProvenanceTemplateField> {
         template_field(
             4,
             "source",
-            ProvenanceCommitMode::Json,
-            ProvenanceFieldDisclosure::Public,
+            ProvenanceCommitMode::JsonSha256,
+            ProvenanceFieldDisclosure::Commitment,
             true,
             "string",
-            "Fetched URL or search query.",
+            "Commitment to the fetched URL or search query.",
         ),
         template_field(
             5,
@@ -1089,10 +1110,31 @@ fn env_or(name: &str, default: &str) -> String {
     optional_env(name).unwrap_or_else(|| default.to_string())
 }
 
-fn env_present(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
+fn explicit_provenance_enabled(value: Option<bool>) -> bool {
+    value == Some(true)
+}
+
+fn validate_publication_policy(
+    visibility: &str,
+    managed_publication: bool,
+    publish_response_artifact: bool,
+    public_disclosure_allowed: bool,
+) -> Result<(), ProvenanceError> {
+    if publish_response_artifact && !managed_publication {
+        return Err(ProvenanceError::InvalidEnv(
+            "LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT requires LIVY_PROVENANCE_MANAGED_PUBLICATION=true"
+                .to_string(),
+        ));
+    }
+    if (visibility == "public" || managed_publication || publish_response_artifact)
+        && !public_disclosure_allowed
+    {
+        return Err(ProvenanceError::InvalidEnv(
+            "public visibility or managed publication requires LIVY_PROVENANCE_ALLOW_PUBLIC_DISCLOSURE=true"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn production_environment() -> bool {
@@ -1211,9 +1253,37 @@ mod tests {
         assert_eq!(fields[0].name, "application_domain");
         assert_eq!(fields[2].commit_mode, ProvenanceCommitMode::JsonSha256);
         assert_eq!(fields[3].disclosure, ProvenanceFieldDisclosure::Commitment);
+        assert_eq!(fields[4].commit_mode, ProvenanceCommitMode::JsonSha256);
+        assert_eq!(fields[4].disclosure, ProvenanceFieldDisclosure::Commitment);
         assert_eq!(ATTESTATION_CLAIM, "source");
         assert_eq!(SUBJECT_TYPE, "resolver_fetch");
-        assert_eq!(DEFAULT_SCHEMA_ID, "resolver-fetch-v1");
+        assert_eq!(DEFAULT_SCHEMA_ID, "resolver-fetch-v2");
+        assert_eq!(DEFAULT_SCHEMA_VERSION, "2");
+    }
+
+    #[test]
+    fn provenance_requires_explicit_enablement_and_defaults_private() {
+        assert!(!explicit_provenance_enabled(None));
+        assert!(!explicit_provenance_enabled(Some(false)));
+        assert!(explicit_provenance_enabled(Some(true)));
+        assert_eq!(DEFAULT_VISIBILITY, "private");
+        assert!(
+            validate_publication_policy(
+                DEFAULT_VISIBILITY,
+                DEFAULT_MANAGED_PUBLICATION,
+                DEFAULT_PUBLISH_RESPONSE_ARTIFACT,
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn public_provenance_side_effects_require_explicit_disclosure_consent() {
+        assert!(validate_publication_policy("public", false, false, false).is_err());
+        assert!(validate_publication_policy("private", true, false, false).is_err());
+        assert!(validate_publication_policy("private", false, true, true).is_err());
+        assert!(validate_publication_policy("public", true, true, true).is_ok());
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod errors;
 mod fetch;
 mod mcp;
 mod provenance;
+mod receipt_store;
 mod security;
 mod snapshot_upload;
 mod types;
@@ -32,7 +33,7 @@ use rmcp::transport::streamable_http_server::{
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let security_config = config::SecurityConfig::from_env().map_err(FetchError::Http)?;
-    let fetcher = Arc::new(fetch::Fetcher::new());
+    let fetcher = Arc::new(fetch::Fetcher::new()?);
     let mcp_fetcher = fetcher.clone();
     let resolver_auth = Arc::new(auth::ResolverAuth::from_env());
     let resolver_credits = Arc::new(credits::ResolverCreditsClient::from_env());
