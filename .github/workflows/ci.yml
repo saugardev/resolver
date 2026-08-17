@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out complete history
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -53,8 +53,8 @@ jobs:
       - name: Validate checked-in contracts and scripts
         run: |
           ruby scripts/validate-contracts.rb
-          bash -n scripts/smoke.sh scripts/verify-fresh-checkout.sh
-          shellcheck scripts/smoke.sh scripts/verify-fresh-checkout.sh
+          bash -n scripts/container-smoke.sh scripts/smoke.sh scripts/verify-fresh-checkout.sh
+          shellcheck scripts/container-smoke.sh scripts/smoke.sh scripts/verify-fresh-checkout.sh
 
       - name: Install pinned audit tools
         run: |
@@ -96,7 +96,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
         with:
           persist-credentials: false
 
@@ -109,23 +109,4 @@ jobs:
           test "$(docker image inspect livy-resolver:ci --format '{{join .Config.Entrypoint " "}}')" = "/usr/local/bin/livy-resolver"
 
       - name: Run hardened container smoke
-        run: |
-          container_id="$(docker run --detach --publish-all --read-only \
-            --cap-drop ALL --security-opt no-new-privileges \
-            --env LIVY_RESOLVER_KEY=container-smoke-not-a-secret \
-            --env LIVY_RESOLVER_AUTH_ENABLED=false \
-            --env LIVY_RESOLVER_CREDITS_ENABLED=false \
-            --env LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true \
-            livy-resolver:ci)"
-          trap 'docker rm --force "${container_id}" >/dev/null 2>&1 || true' EXIT
-          host_port="$(docker port "${container_id}" 3001/tcp | awk -F: '{print $NF}')"
-          for _ in $(seq 1 50); do
-            if curl --fail --silent "http://127.0.0.1:${host_port}/healthz" >/tmp/container-health.json; then
-              break
-            fi
-            sleep 0.1
-          done
-          grep --fixed-strings '"status":"alive"' /tmp/container-health.json
-          test "$(curl --silent --output /tmp/container-ready.json --write-out '%{http_code}' \
-            "http://127.0.0.1:${host_port}/readyz")" = "503"
-          docker stop --time 15 "${container_id}"
+        run: scripts/container-smoke.sh livy-resolver:ci
