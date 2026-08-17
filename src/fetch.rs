@@ -16,8 +16,8 @@ use reqwest::{Client, Response};
 use serde::Serialize;
 use serde_json::{Value, json};
 use spider_client::{
-    CSSSelector, Delay, Engine, IdleNetwork, ProxyType, RequestParams, RequestType, ReturnFormat,
-    ReturnFormatHandling, SearchRequestParams, Selector, Timeout, WaitFor,
+    CSSSelector, Delay, Engine, IdleNetwork, ProxyType, RedirectPolicy, RequestParams, RequestType,
+    ReturnFormat, ReturnFormatHandling, SearchRequestParams, Selector, Timeout, WaitFor,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -656,6 +656,7 @@ impl Fetcher {
             fingerprint: Some(true),
             proxy: Some(ProxyType::Isp),
             proxy_enabled: None,
+            redirect_policy: Some(RedirectPolicy::Strict),
             ..Default::default()
         }
     }
@@ -873,6 +874,7 @@ impl Fetcher {
             // `proxy_enabled` is deprecated by Spider. Sending it together with
             // `proxy` creates contradictory requests (for example ISP + false).
             proxy_enabled: None,
+            redirect_policy: Some(RedirectPolicy::Strict),
             limit: payload.limit,
             depth: payload.depth,
             cache: payload.cache,

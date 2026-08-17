@@ -42,6 +42,8 @@ pub enum FetchError {
     Credits(String),
     #[error("Idempotency key conflicts with a different request")]
     IdempotencyConflict(String),
+    #[error("Egress enforcement unavailable")]
+    EgressUnavailable(String),
     #[error("Snapshot failed")]
     Snapshot(#[from] SnapshotError),
 }
@@ -203,6 +205,11 @@ impl IntoResponse for FetchError {
             FetchError::IdempotencyConflict(message) => {
                 (StatusCode::CONFLICT, "idempotency_conflict", message)
             }
+            FetchError::EgressUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "egress_policy_unavailable",
+                "Source fetching is unavailable until egress enforcement is ready".to_string(),
+            ),
             FetchError::Snapshot(_) => (
                 StatusCode::BAD_GATEWAY,
                 "invalid_upstream_snapshot",

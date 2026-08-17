@@ -10,22 +10,25 @@ mcp = []
 
 [dependencies]
 async-trait = "0.1.89"
+antissrf = { version = "0.1.1", default-features = false }
 axum = {version = "0.8.9" , features = ["macros"]}
 dotenvy = "0.15.7"
 hex = "0.4.3"
 livy-tee = { version = "0.1.1" , features = ["ita-verify"]}
 livy-provenance-sdk = { path = "../livy-core/packages/provenance-sdk" }
 reqwest = "0.12.28"
-rmcp = {version ="1.7.0", features = ["server", "transport-streamable-http-server"]}
+rmcp = {version ="3.1.2", features = ["server", "transport-streamable-http-server"]}
 serde = {version = "1.0.228" , features = ["derive"]}
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 spider-client = "=0.1.87"
 thiserror = "2.0.18"
-tokio = {version = "1.52.1" , features= ["macros", "net", "rt-multi-thread"]}
+tokio = {version = "1.52.1" , features= ["macros", "net", "rt-multi-thread", "signal", "sync", "time"]}
+tokio-util = "0.7.18"
 url = "2.5.8"
 uuid = { version = "1.23.1", features = ["v4"] }
 
 [dev-dependencies]
+futures-util = "0.3.32"
 tokio-stream = "0.1.18"
 tower = { version = "0.5.3", features = ["util"] }

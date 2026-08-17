@@ -9,6 +9,7 @@ use axum::{
 
 use crate::auth::ResolverAuthContext;
 use crate::credits::{ResolverCreditAuthorization, ResolverCreditsClient};
+use crate::egress::EgressPolicy;
 use crate::errors::FetchError;
 use crate::fetch::{Fetcher, PendingProductFetch};
 use crate::types::{
@@ -75,9 +76,12 @@ pub async fn fetch_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
+    payload.validate_for(ProductRoute::Scrape)?;
+    egress.validate_source(payload.require_source()?).await?;
     let pending = prepare_and_capture_product(
         &fetcher,
         &credits,
@@ -98,9 +102,12 @@ pub async fn crawl_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
+    payload.validate_for(ProductRoute::Crawl)?;
+    egress.validate_source(payload.require_source()?).await?;
     let pending = prepare_and_capture_product(
         &fetcher,
         &credits,
@@ -121,9 +128,12 @@ pub async fn map_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
+    payload.validate_for(ProductRoute::Map)?;
+    egress.validate_source(payload.require_source()?).await?;
     let pending = prepare_and_capture_product(
         &fetcher,
         &credits,
@@ -144,9 +154,12 @@ pub async fn search_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
+    payload.validate_for(ProductRoute::Search)?;
+    egress.require_actual_fetch_capability().await?;
     let pending = prepare_and_capture_product(
         &fetcher,
         &credits,
@@ -167,9 +180,12 @@ pub async fn extract_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
+    payload.validate_for(ProductRoute::Extract)?;
+    egress.validate_source(payload.require_source()?).await?;
     let pending = prepare_and_capture_product(
         &fetcher,
         &credits,
@@ -190,9 +206,12 @@ pub async fn screenshot_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
+    payload.validate_for(ProductRoute::Screenshot)?;
+    egress.validate_source(payload.require_source()?).await?;
     let pending = prepare_and_capture_product(
         &fetcher,
         &credits,
@@ -213,10 +232,12 @@ pub async fn fetch_fast(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<FetchWithReceipt>, FetchError> {
     validate_source_url(&payload.source)?;
+    egress.validate_source(&payload.source).await?;
     let mut request = Fetcher::fast_request(&payload.source);
     request.provenance = payload.provenance;
     let pending = prepare_and_capture_product(
@@ -266,9 +287,12 @@ pub async fn snapshot_source(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<crate::snapshot_upload::SnapshotPayload>, FetchError> {
+    validate_source_url(&payload.source)?;
+    egress.validate_source(&payload.source).await?;
     let request = Fetcher::snapshot_request(&payload.source, payload.provenance);
     request.validate_for(ProductRoute::Snapshot)?;
     let idempotency_key = idempotency_key(&headers)?;
@@ -315,10 +339,12 @@ pub async fn fetch_unblock(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     headers: HeaderMap,
     ApiJson(payload): ApiJson<FetchRequest>,
 ) -> Result<Json<FetchWithReceipt>, FetchError> {
     validate_source_url(&payload.source)?;
+    egress.validate_source(&payload.source).await?;
     let mut request = Fetcher::unblock_request(&payload.source, true);
     request.provenance = payload.provenance;
     let pending = prepare_and_capture_product(
@@ -568,6 +594,7 @@ mod tests {
         Json(json!({
             "active": true,
             "sub": "user-a",
+            "iss": "https://auth.livylabs.xyz",
             "scope": "resolver:source:fetch resolver:source:crawl resolver:source:map resolver:source:search resolver:source:extract resolver:source:screenshot resolver:snapshot:create resolver:receipt:read",
             "aud": "https://resolver.api.livylabs.xyz/mcp",
             "client_id": "test-client",
@@ -780,6 +807,10 @@ mod tests {
             .route("/fetchfast", post(fetch_fast))
             .route("/fetchunblock", post(fetch_unblock))
             .layer(Extension(credits))
+            .layer(Extension(Arc::new(EgressPolicy::for_tests(
+                &["example.com"],
+                true,
+            ))))
             .route_layer(middleware::from_fn_with_state(
                 auth,
                 crate::auth::require_product_oauth,

@@ -42,6 +42,11 @@ LIVY_RESOLVER_OAUTH_AUDIENCE=https://resolver.api.livylabs.xyz/mcp
 LIVY_RESOLVER_OAUTH_RESOURCE_METADATA_URL=https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource
 ```
 
+Introspection responses must contain the configured issuer, the configured MCP
+audience, the Livy tenant/project claims, and the exact route scope. Alternate
+audiences are accepted only when explicitly listed in
+`LIVY_RESOLVER_OAUTH_ACCEPTED_AUDIENCES`; the legacy audience is not implicit.
+
 ## Livy Provenance
 
 The resolver can store a Livy provenance attestation for every successful
@@ -280,7 +285,17 @@ these deployment safety limits with:
 LIVY_RESOLVER_MAX_PRODUCT_BODY_BYTES=65536
 LIVY_RESOLVER_PRODUCT_TIMEOUT_SECS=65
 LIVY_RESOLVER_MAX_UPSTREAM_BYTES=8388608
+LIVY_RESOLVER_MCP_TIMEOUT_SECS=65
+LIVY_RESOLVER_SHUTDOWN_GRACE_SECS=10
 LIVY_RESOLVER_HSTS_ENABLED=false
+LIVY_RESOLVER_DNS_TIMEOUT_SECS=3
+LIVY_RESOLVER_ALLOW_PRIVATE_SOURCES=false
+# Required in production before any Spider-backed source operation is accepted:
+SPIDER_API_URL=https://api.spider.cloud
+LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION=spider-egress-policy-v1
+LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL=https://api.spider.cloud/egress-capability
+LIVY_RESOLVER_SPIDER_EGRESS_READINESS_TIMEOUT_SECS=3
+LIVY_RESOLVER_ALLOW_INSECURE_SPIDER_DEV=false
 ```
 
 Spider calls have a five-second connect timeout, a 65-second client ceiling,
@@ -291,10 +306,55 @@ payload item whose source `status` is outside 200–299 maps to an upstream erro
 before credit capture, receipt creation, or provenance creation.
 
 Enable HSTS only when the public endpoint is served through HTTPS. The API
-accepts absolute HTTP and HTTPS source URLs, including localhost and private
-addresses, because internal-source resolution is supported. Deploy Spider and
-the resolver behind egress controls that block cloud metadata services and
-other destinations that must not be reachable.
+accepts absolute HTTP and HTTPS source URLs that resolve exclusively to public
+addresses. Literal and DNS-resolved loopback, private, carrier-grade NAT,
+link-local, documentation, benchmarking, transition, multicast, reserved,
+IPv4-embedded metadata, and cloud-metadata destinations are rejected before
+credit debit. Mixed public/private DNS answers also fail closed and local DNS is
+checked on every request.
+
+Those local checks cannot bind the address used by the remote Spider service.
+Consequently, all Spider-backed operations (including search) fail with 503 by
+default. Production must set the exact
+`LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION=spider-egress-policy-v1` value and a
+bounded `LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL`. This is an operator
+attestation—not automatic discovery—that the selected Spider deployment or
+policy proxy rejects non-public initial destinations, DNS changes, and every
+redirect target. The resolver explicitly requests Spider's strict redirect
+policy and requires an authenticated capability endpoint on the exact normalized
+`SPIDER_API_URL` origin. A separate readiness origin is not supported; deploy a
+policy proxy by making it `SPIDER_API_URL` so it is also the actual fetch path.
+The probe uses the Spider bearer credential, requires HTTPS, disables redirects,
+caps the response at 4 KiB, and accepts only `application/json` with exactly:
+
+```json
+{
+  "schema": "livy.resolver.spider-egress-capability/v1",
+  "spider_api_url": "https://api.spider.cloud",
+  "dns_all_answers_enforced": true,
+  "redirect_every_hop_enforced": true
+}
+```
+
+Unknown fields, a different upstream identity, false controls, plain 2xx
+responses, and redirected probes fail closed. Loopback HTTP is available only
+with the explicit `LIVY_RESOLVER_ALLOW_INSECURE_SPIDER_DEV=true` development
+override. The resolver requires a successful probe before every debit/fetch.
+Keep the policy at the infrastructure egress point where the actual connection
+is made.
+
+For a trusted internal deployment, the narrow
+`LIVY_RESOLVER_TRUSTED_SOURCE_HOSTS` allow-list bypasses only the local
+preflight. The broader `LIVY_RESOLVER_ALLOW_PRIVATE_SOURCES=true` override also
+affects only local preflight. Neither bypasses the remote enforcement
+attestation/readiness requirement, and neither should be used on an
+internet-facing resolver without a separately reviewed egress policy.
+
+`/healthz` is process liveness. `/readyz` performs the bounded Spider egress
+capability probe and returns 200 only while it succeeds and the listener accepts
+work. It switches to 503 before graceful shutdown drains requests and cancels
+MCP work. Shutdown is hard-bounded by
+`LIVY_RESOLVER_SHUTDOWN_GRACE_SECS` (10 seconds by default).
 
 Errors retain the existing top-level `error` string and add stable `code` and
 `request_id` fields. Responses include `x-request-id`; logs are JSON objects
@@ -319,9 +379,11 @@ rejections, and gateway 429 responses. Do not attach raw source URLs as labels.
 - Tool: `fetch_source` — input `{ "url": "...", "publish_provenance": false, "reveal_provenance_response": false }`
 - Side effects: the descriptor truthfully marks the tool non-read-only and destructive because successful calls debit credits and store a tenant receipt; enabled provenance may create a private attestation, while public publication/reveal occurs only with authenticated explicit consent and deployment capability
 - Output: successful calls include both `receipt_id` and `explorer`, where `explorer` is `https://explorer.livylabs.xyz/?q=<receipt_id>` with the actual receipt id substituted
-- Auth: protected MCP requests require `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver MCP endpoint audience
+- Auth: protected MCP requests require `Authorization: Bearer <livy_oauth_access_token>` with the exact `tool:fetch_source` scope, configured issuer, and resolver MCP endpoint audience. Authentication is performed once at the HTTP boundary and its context is reused by tool dispatch.
 - Discovery: unauthenticated MCP requests return HTTP `401` with `WWW-Authenticate` pointing at the protected-resource metadata URL. After OAuth, clients can call `initialize`, `notifications/initialized`, and `tools/list` with the bearer token. The tool implementation keeps `_meta["mcp/www_authenticate"]` compatibility for contexts that reach tool dispatch directly.
-- ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `title` and `securitySchemes`, `_meta.securitySchemes`, short invocation status text, and read-only/open-world annotations
+- Transport: stateful sessions are disabled; requests use stateless JSON responses, avoiding unbounded in-memory sessions and replica stickiness. Requests are deadline-bound by `LIVY_RESOLVER_MCP_TIMEOUT_SECS`; deadline, disconnect, and shutdown cancellation propagate into the tool operation so upstream and side-effect work does not continue detached.
+- Host/origin policy: `LIVY_RESOLVER_MCP_ALLOWED_HOSTS` and `LIVY_RESOLVER_MCP_ALLOWED_ORIGINS` are non-empty allow-lists. Defaults accept only local development values; production must explicitly set its public hostname and browser origins. Origins are matched by exact scheme, host, and effective port, so `https://app.example` permits port 443 but not port 4444.
+- ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `title` and `securitySchemes`, `_meta.securitySchemes`, short invocation status text, and open-world annotations. It is explicitly not read-only and is marked destructive because it can debit credits, store a receipt, and create irreversible public provenance.
 
 Use when the prompt contains `source: <url>`, "only take this source", "source of truth", or an explicitly required URL. Pass the exact URL, don't search or substitute.
 

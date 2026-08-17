@@ -5,10 +5,12 @@ use crate::api::{
     screenshot_post, search_post, snapshot_source,
 };
 use crate::auth::{self, ResolverAuth};
-use crate::config::SecurityConfig;
+use crate::config::{McpRuntimeConfig, SecurityConfig};
 use crate::credits::ResolverCreditsClient;
+use crate::egress::EgressPolicy;
 use crate::errors::{FetchError, Result};
 use crate::fetch::Fetcher;
+use crate::lifecycle::{self, RuntimeState};
 use crate::mcp::{self, FetchFallbackCache};
 use crate::receipt_store::{ReceiptStore, ReceiptStoreFactory};
 use crate::security;
@@ -21,19 +23,35 @@ use axum::{
     routing::{get, post},
 };
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
 };
-use std::sync::Arc;
+use std::{future::IntoFuture, sync::Arc};
 
 #[derive(Clone)]
 struct ReceiptReadiness(Arc<dyn ReceiptStore>);
+
+struct BuiltApp {
+    router: Router,
+    runtime_state: Arc<RuntimeState>,
+    mcp_cancellation: tokio_util::sync::CancellationToken,
+    shutdown_grace: std::time::Duration,
+}
 
 /// Build the complete resolver router with an application-supplied receipt store factory.
 pub async fn build_app_with_receipt_store_factory(
     factory: &dyn ReceiptStoreFactory,
 ) -> Result<Router> {
+    let built = build_runtime(factory).await?;
+    built.runtime_state.mark_ready();
+    Ok(built.router)
+}
+
+async fn build_runtime(factory: &dyn ReceiptStoreFactory) -> Result<BuiltApp> {
     dotenvy::dotenv().ok();
     let security_config = SecurityConfig::from_env().map_err(FetchError::Http)?;
+    let shutdown_grace = security_config.shutdown_grace;
+    let mcp_runtime = McpRuntimeConfig::from_env().map_err(FetchError::Http)?;
+    let egress_policy = Arc::new(EgressPolicy::from_env().map_err(FetchError::Http)?);
     let receipts = factory
         .create()
         .await
@@ -41,26 +59,30 @@ pub async fn build_app_with_receipt_store_factory(
     let readiness = ReceiptReadiness(receipts.clone());
     let fetcher = Arc::new(Fetcher::with_receipt_store(receipts).await?);
     let mcp_fetcher = fetcher.clone();
-    let resolver_auth = Arc::new(ResolverAuth::from_env());
+    let resolver_auth = Arc::new(ResolverAuth::from_env().map_err(FetchError::Http)?);
     let resolver_credits = Arc::new(ResolverCreditsClient::from_env());
     let mcp_fallback_cache = Arc::new(FetchFallbackCache::default());
     let mcp_auth = resolver_auth.clone();
     let mcp_credits = resolver_credits.clone();
+    let mcp_egress = egress_policy.clone();
     let metadata_auth = resolver_auth.clone();
     let mcp_metadata_auth = resolver_auth.clone();
     let mcp_challenge_auth = resolver_auth.clone();
 
+    let mcp_server_config = mcp_config(&mcp_runtime);
+    let mcp_cancellation = mcp_server_config.cancellation_token.clone();
     let mcp_service = StreamableHttpService::new(
         move || {
             Ok(mcp::Server::new(
                 mcp_fetcher.clone(),
                 mcp_auth.clone(),
                 mcp_credits.clone(),
+                mcp_egress.clone(),
                 mcp_fallback_cache.clone(),
             ))
         },
-        LocalSessionManager::default().into(),
-        mcp_config(),
+        NeverSessionManager::default().into(),
+        mcp_server_config,
     );
 
     let product_routes = Router::new()
@@ -76,6 +98,7 @@ pub async fn build_app_with_receipt_store_factory(
         .route("/receipt/{id}", get(get_receipt))
         .route("/recipt/{id}", get(get_receipt))
         .layer(Extension(resolver_credits.clone()))
+        .layer(Extension(egress_policy.clone()))
         .layer(DefaultBodyLimit::max(security_config.product_body_bytes))
         .layer(middleware::from_fn_with_state(
             security_config.clone(),
@@ -93,11 +116,21 @@ pub async fn build_app_with_receipt_store_factory(
             mcp_challenge_auth,
             mcp::challenge_protected_mcp_requests,
         ))
-        .layer(middleware::from_fn(mcp::mirror_tools_list_security_schemes));
+        .layer(middleware::from_fn(mcp::mirror_tools_list_security_schemes))
+        .layer(middleware::from_fn_with_state(
+            mcp_runtime,
+            security::exact_mcp_origin,
+        ))
+        .layer(middleware::from_fn_with_state(
+            security_config.clone(),
+            security::mcp_timeout,
+        ));
 
-    Ok(Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(receipt_readiness))
+    let runtime_state = Arc::new(RuntimeState::new());
+
+    let router = Router::new()
+        .route("/healthz", get(lifecycle::liveness))
+        .route("/readyz", get(application_readiness))
         .route(
             "/.well-known/oauth-protected-resource",
             get(move || {
@@ -115,16 +148,25 @@ pub async fn build_app_with_receipt_store_factory(
         .merge(product_routes)
         .merge(mcp_routes)
         .layer(Extension(readiness))
+        .layer(Extension(runtime_state.clone()))
+        .layer(Extension(egress_policy))
         .layer(middleware::from_fn_with_state(
             security_config,
             security::request_security,
         ))
-        .with_state(fetcher))
+        .with_state(fetcher);
+
+    Ok(BuiltApp {
+        router,
+        runtime_state,
+        mcp_cancellation,
+        shutdown_grace,
+    })
 }
 
 /// Build and serve the resolver with an application-supplied receipt store factory.
 pub async fn run_with_receipt_store_factory(factory: &dyn ReceiptStoreFactory) -> Result<()> {
-    let app = build_app_with_receipt_store_factory(factory).await?;
+    let built = build_runtime(factory).await?;
     let port = std::env::var("PORT")
         .or_else(|_| std::env::var("RESOLVER_PORT"))
         .unwrap_or_else(|_| "3001".to_string());
@@ -132,34 +174,102 @@ pub async fn run_with_receipt_store_factory(factory: &dyn ReceiptStoreFactory) -
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|err| FetchError::Http(err.to_string()))?;
+    built.runtime_state.mark_ready();
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| FetchError::Http(err.to_string()))
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, built.router)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => {
+            result.map_err(|err| FetchError::Http(err.to_string()))?;
+        }
+        () = shutdown_signal() => {
+            begin_shutdown(&built.runtime_state, &built.mcp_cancellation);
+            let _ = shutdown_tx.send(());
+            tokio::time::timeout(built.shutdown_grace, &mut server)
+                .await
+                .map_err(|_| FetchError::Timeout(format!(
+                    "graceful shutdown exceeded {} seconds",
+                    built.shutdown_grace.as_secs()
+                )))?
+                .map_err(|err| FetchError::Http(err.to_string()))?;
+        }
+    }
+
+    Ok(())
 }
 
-async fn receipt_readiness(Extension(readiness): Extension<ReceiptReadiness>) -> Response {
-    match readiness.0.health_check().await {
-        Ok(()) => (StatusCode::OK, "ready").into_response(),
-        Err(_) => (
+async fn application_readiness(
+    Extension(receipts): Extension<ReceiptReadiness>,
+    Extension(runtime): Extension<Arc<RuntimeState>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
+) -> Response {
+    if receipts.0.health_check().await.is_err() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "Receipt storage is unavailable",
                 "code": "receipt_store_unavailable",
             })),
         )
-            .into_response(),
+            .into_response();
+    }
+    lifecycle::readiness(Extension(runtime), Extension(egress)).await
+}
+
+fn mcp_config(runtime: &McpRuntimeConfig) -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+        .with_allowed_hosts(runtime.allowed_hosts.clone())
+        .with_allowed_origins(runtime.allowed_origins.clone())
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to install Ctrl+C handler: {err}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => eprintln!("failed to install SIGTERM handler: {err}"),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
     }
 }
 
-fn mcp_config() -> StreamableHttpServerConfig {
-    StreamableHttpServerConfig::default().disable_allowed_hosts()
+fn begin_shutdown(
+    runtime_state: &RuntimeState,
+    mcp_cancellation: &tokio_util::sync::CancellationToken,
+) {
+    runtime_state.begin_draining();
+    mcp_cancellation.cancel();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ReceiptReadiness, build_app_with_receipt_store_factory, receipt_readiness};
+    use super::{ReceiptReadiness, application_readiness, build_app_with_receipt_store_factory};
     use crate::FetchError;
+    use crate::egress::EgressPolicy;
+    use crate::lifecycle::RuntimeState;
     use crate::receipt_store::{
         ReceiptOwner, ReceiptStore, ReceiptStoreError, ReceiptStoreFactory,
     };
@@ -238,7 +348,14 @@ mod tests {
             Err(FetchError::Http(message)) if message.contains("receipt store health check failed")
         ));
 
-        let response = receipt_readiness(Extension(ReceiptReadiness(store))).await;
+        let runtime = Arc::new(RuntimeState::new());
+        runtime.mark_ready();
+        let response = application_readiness(
+            Extension(ReceiptReadiness(store)),
+            Extension(runtime),
+            Extension(Arc::new(EgressPolicy::for_tests(&[], true))),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -248,5 +365,164 @@ mod tests {
             build_app_with_receipt_store_factory(&FailingFactory).await,
             Err(FetchError::Http(message)) if message.contains("receipt store initialization failed")
         ));
+    }
+}
+
+#[cfg(test)]
+mod mcp_runtime_tests {
+    use super::{begin_shutdown, mcp_config};
+    use crate::{config, egress, lifecycle, mcp, security};
+    use axum::{
+        Extension, Router,
+        body::{Body, to_bytes},
+        http::Request,
+        middleware,
+    };
+    use rmcp::{
+        ErrorData, ServerHandler,
+        handler::server::{router::tool::ToolRouter, tool::Extension as McpExtension},
+        model::{CallToolResult, ContentBlock},
+        tool, tool_handler, tool_router,
+        transport::streamable_http_server::{
+            StreamableHttpService, session::never::NeverSessionManager,
+        },
+    };
+    use std::{
+        convert::Infallible,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::Poll,
+        time::{Duration, Instant},
+    };
+    use tower::ServiceExt;
+
+    type ToolResult<T, E> = std::result::Result<T, E>;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestServer;
+
+    impl ServerHandler for TestServer {}
+
+    #[derive(Debug, Clone)]
+    struct TestToolServer {
+        #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
+        tool_router: ToolRouter<Self>,
+        cancelled: Arc<AtomicBool>,
+        evidence: Arc<AtomicUsize>,
+    }
+
+    impl TestToolServer {
+        fn new(cancelled: Arc<AtomicBool>, evidence: Arc<AtomicUsize>) -> Self {
+            Self {
+                tool_router: Self::tool_router(),
+                cancelled,
+                evidence,
+            }
+        }
+    }
+
+    #[tool_router]
+    impl TestToolServer {
+        #[tool(
+            name = "fetch_source",
+            description = "Slow upstream test tool",
+            annotations(
+                title = "Fetch Source",
+                read_only_hint = false,
+                destructive_hint = true,
+                open_world_hint = true
+            )
+        )]
+        async fn fetch_source(
+            &self,
+            McpExtension(parts): McpExtension<axum::http::request::Parts>,
+            rmcp_cancellation: tokio_util::sync::CancellationToken,
+        ) -> ToolResult<CallToolResult, ErrorData> {
+            let deadline_cancellation = parts
+                .extensions
+                .get::<security::McpRequestCancellation>()
+                .map(|cancellation| cancellation.0.clone())
+                .unwrap_or_default();
+            tokio::select! {
+                () = deadline_cancellation.cancelled() => {
+                    self.cancelled.store(true, Ordering::Release);
+                    Err(ErrorData::internal_error("cancelled", None))
+                }
+                () = rmcp_cancellation.cancelled() => {
+                    self.cancelled.store(true, Ordering::Release);
+                    Err(ErrorData::internal_error("cancelled", None))
+                }
+                () = tokio::time::sleep(Duration::from_millis(250)) => {
+                    self.evidence.fetch_add(1, Ordering::AcqRel);
+                    Ok(CallToolResult::success(vec![ContentBlock::text("finished")]))
+                }
+            }
+        }
+    }
+
+    #[tool_handler]
+    impl ServerHandler for TestToolServer {}
+
+    #[test]
+    fn mcp_transport_is_host_origin_restricted_and_stateless() {
+        let runtime = config::McpRuntimeConfig {
+            allowed_hosts: vec!["resolver.example".into()],
+            allowed_origins: vec!["https://app.example".into()],
+        };
+        let config = mcp_config(&runtime);
+        assert_eq!(config.allowed_hosts, vec!["resolver.example"]);
+        assert_eq!(config.allowed_origins, vec!["https://app.example"]);
+        assert!(!config.legacy_session_mode);
+        assert!(config.json_response);
+    }
+
+    #[tokio::test]
+    async fn mcp_transport_rejects_attacker_host_and_origin() {
+        let runtime = config::McpRuntimeConfig {
+            allowed_hosts: vec!["resolver.example".into()],
+            allowed_origins: vec!["https://app.example".into()],
+        };
+        let service = StreamableHttpService::new(
+            || Ok::<_, std::io::Error>(TestServer),
+            NeverSessionManager::default().into(),
+            mcp_config(&runtime),
+        );
+        let response = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("http://resolver.example/mcp")
+                    .header("host", "attacker.example")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("service response");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let response = service
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("http://resolver.example/mcp")
+                    .header("host", "resolver.example")
+                    .header("origin", "https://attacker.example")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("service response");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
 }

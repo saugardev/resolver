@@ -2,6 +2,7 @@
 
 use crate::auth::{ResolverAuth, ResolverAuthContext};
 use crate::credits::ResolverCreditsClient;
+use crate::egress::EgressPolicy;
 use crate::errors::ResolverAuthError;
 use crate::fetch::Fetcher;
 use crate::types::{
@@ -19,7 +20,7 @@ use rmcp::{
     ErrorData, ServerHandler,
     handler::server::tool::Extension,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, Meta},
+    model::{CallToolResult, ContentBlock as Content, MetaObject as Meta},
     schemars, tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
@@ -29,8 +30,9 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
-const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source", "resolver:source:fetch"];
+const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source"];
 const FETCH_SOURCE_TITLE: &str = "Fetch Source";
 const FETCH_SOURCE_DESCRIPTION: &str = "Fetch the exact source URL supplied by the user using adaptive resolver routing. This operation debits Livy credits and stores a tenant-scoped receipt. When provenance is enabled it may also create a private attestation; public publication or response reveal additionally requires deployment capability and explicit authenticated request consent. Do not perform web search or substitute another article.";
 const FETCH_SOURCE_INVOCATION_START: &str = "Fetching source";
@@ -66,6 +68,7 @@ pub struct Server {
     fetcher: Arc<Fetcher>,
     auth: Arc<ResolverAuth>,
     credits: Arc<ResolverCreditsClient>,
+    egress: Arc<EgressPolicy>,
     fallback_cache: Arc<FetchFallbackCache>,
 }
 
@@ -144,12 +147,14 @@ impl Server {
         fetcher: Arc<Fetcher>,
         auth: Arc<ResolverAuth>,
         credits: Arc<ResolverCreditsClient>,
+        egress: Arc<EgressPolicy>,
         fallback_cache: Arc<FetchFallbackCache>,
     ) -> Self {
         Self {
             fetcher,
             auth,
             credits,
+            egress,
             fallback_cache,
         }
     }
@@ -171,14 +176,35 @@ impl Server {
     async fn fetch_source(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(Params {
+        Parameters(params): Parameters<Params>,
+        rmcp_cancellation: CancellationToken,
+    ) -> Result<CallToolResult, ErrorData> {
+        let deadline_cancellation = parts
+            .extensions
+            .get::<crate::security::McpRequestCancellation>()
+            .map(|cancellation| cancellation.0.clone())
+            .unwrap_or_default();
+        tokio::select! {
+            biased;
+            () = deadline_cancellation.cancelled() => Err(request_cancelled()),
+            () = rmcp_cancellation.cancelled() => Err(request_cancelled()),
+            result = self.fetch_source_operation(parts, params) => result,
+        }
+    }
+}
+
+impl Server {
+    async fn fetch_source_operation(
+        &self,
+        parts: Parts,
+        Params {
             url,
             idempotency_key,
             publish_provenance,
             reveal_provenance_response,
-        }): Parameters<Params>,
+        }: Params,
     ) -> Result<CallToolResult, ErrorData> {
-        let auth_context = match self.require_oauth(&parts).await? {
+        let auth_context = match require_oauth_context(&self.auth, &parts)? {
             Ok(context) => context,
             Err(result) => return Ok(result),
         };
@@ -186,6 +212,12 @@ impl Server {
         if let Err(err) = validate_source_url(&url)
             .and_then(|_| validate_idempotency_key(idempotency_key.as_deref()))
         {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Invalid fetch_source request: {}",
+                public_validation_message(&err)
+            ))]));
+        }
+        if let Err(err) = self.egress.validate_source(&url).await {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Invalid fetch_source request: {}",
                 public_validation_message(&err)
@@ -379,6 +411,10 @@ impl Server {
     }
 }
 
+fn request_cancelled() -> ErrorData {
+    ErrorData::internal_error("MCP request cancelled", None)
+}
+
 fn public_validation_message(error: &crate::errors::FetchError) -> &str {
     match error {
         crate::errors::FetchError::BadRequest(message) => message,
@@ -406,7 +442,11 @@ async fn require_mcp_oauth_or_challenge(
         )
         .await
     {
-        Ok(_) => next.run(request).await,
+        Ok(context) => {
+            let mut request = request;
+            request.extensions_mut().insert(context);
+            next.run(request).await
+        }
         Err(ResolverAuthError::ServiceUnavailable(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -531,6 +571,12 @@ async fn mirror_tools_list_response_security_schemes(response: Response) -> Resp
 }
 
 fn enrich_tools_list_response_for_chatgpt(body: &str) -> (String, bool) {
+    if let Ok(mut value) = serde_json::from_str::<Value>(body)
+        && enrich_tools_list_payload_for_chatgpt(&mut value)
+    {
+        return (value.to_string(), true);
+    }
+
     let mut changed = false;
     let mut rewritten = String::with_capacity(body.len());
 
@@ -546,7 +592,7 @@ fn enrich_tools_list_response_for_chatgpt(body: &str) -> (String, bool) {
             continue;
         };
 
-        if enrich_tools_list_message_for_chatgpt(&mut value) {
+        if enrich_tools_list_payload_for_chatgpt(&mut value) {
             changed = true;
             rewritten.push_str("data: ");
             rewritten.push_str(&value.to_string());
@@ -557,6 +603,15 @@ fn enrich_tools_list_response_for_chatgpt(body: &str) -> (String, bool) {
     }
 
     (rewritten, changed)
+}
+
+fn enrich_tools_list_payload_for_chatgpt(payload: &mut Value) -> bool {
+    match payload {
+        Value::Array(messages) => messages.iter_mut().fold(false, |changed, message| {
+            enrich_tools_list_message_for_chatgpt(message) || changed
+        }),
+        message => enrich_tools_list_message_for_chatgpt(message),
+    }
 }
 
 fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
@@ -672,37 +727,22 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
     changed
 }
 
-impl Server {
-    async fn require_oauth(
-        &self,
-        parts: &Parts,
-    ) -> Result<Result<ResolverAuthContext, CallToolResult>, ErrorData> {
-        match self
-            .auth
-            .validate_authorization_header(
-                parts.headers.get(header::AUTHORIZATION),
-                FETCH_SOURCE_SCOPES,
-            )
-            .await
-        {
-            Ok(context) => Ok(Ok(context)),
-            Err(ResolverAuthError::ServiceUnavailable(_)) => Err(ErrorData::internal_error(
-                "OAuth validation service is unavailable",
-                None,
-            )),
-            Err(err) => {
-                let Some((error, message)) = err.challenge_parts() else {
-                    return Err(ErrorData::internal_error("OAuth validation failed", None));
-                };
-                Ok(Err(oauth_challenge_result(
-                    &self.auth,
-                    FETCH_SOURCE_SCOPES,
-                    error,
-                    message,
-                )))
-            }
-        }
+fn require_oauth_context(
+    auth: &ResolverAuth,
+    parts: &Parts,
+) -> Result<Result<ResolverAuthContext, CallToolResult>, ErrorData> {
+    if let Some(context) = parts.extensions.get::<ResolverAuthContext>() {
+        return Ok(Ok(context.clone()));
     }
+
+    // HTTP middleware is the single authentication boundary. Re-introspecting here would
+    // double the auth dependency load and could produce inconsistent results mid-request.
+    Ok(Err(oauth_challenge_result(
+        auth,
+        FETCH_SOURCE_SCOPES,
+        "invalid_request",
+        "validated OAuth context is missing",
+    )))
 }
 
 fn oauth_challenge_result(
@@ -946,10 +986,15 @@ mod tests {
     use super::{
         FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Params, Server,
         mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
-        structured_fetch_result,
+        require_oauth_context, structured_fetch_result,
     };
     use crate::types::{FetchWithReceipt, Receipt};
-    use crate::{auth::ResolverAuth, credits::ResolverCreditsClient, fetch::Fetcher};
+    use crate::{
+        auth::{ResolverAuth, ResolverAuthContext},
+        credits::ResolverCreditsClient,
+        egress::EgressPolicy,
+        fetch::Fetcher,
+    };
     use axum::{
         Json, Router,
         body::to_bytes,
@@ -966,6 +1011,7 @@ mod tests {
         },
         time::{Duration, Instant},
     };
+    use tokio_util::sync::CancellationToken;
 
     #[derive(Clone)]
     struct McpBoundaryState {
@@ -994,6 +1040,7 @@ mod tests {
         Json(json!({
             "active": true,
             "sub": "user-a",
+            "iss": "https://auth.livylabs.xyz",
             "scope": "tool:fetch_source",
             "aud": "https://resolver.api.livylabs.xyz/mcp",
             "client_id": "mcp-test",
@@ -1028,6 +1075,18 @@ mod tests {
             "created_at": "2026-08-17T00:00:00Z",
             "updated_at": "2026-08-17T00:00:00Z"
         }))
+    }
+
+    fn mcp_auth_context() -> ResolverAuthContext {
+        ResolverAuthContext {
+            access_token: Some("mcp-token".into()),
+            subject: Some("user-a".into()),
+            client_id: Some("mcp-test".into()),
+            scopes: vec!["tool:fetch_source".into()],
+            audiences: vec!["https://resolver.api.livylabs.xyz/mcp".into()],
+            tenant_id: Some("tenant-a".into()),
+            project_id: Some("project-a".into()),
+        }
     }
 
     #[tokio::test]
@@ -1072,10 +1131,12 @@ mod tests {
                 "{control_base}/oauth/introspect"
             ))),
             Arc::new(ResolverCreditsClient::for_tests(control_base)),
+            Arc::new(EgressPolicy::for_tests(&["example.com"], true)),
             Arc::new(FetchFallbackCache::default()),
         );
         let (parts, _) = Request::builder()
             .header(header::AUTHORIZATION, "Bearer mcp-token")
+            .extension(mcp_auth_context())
             .body(())
             .expect("MCP request")
             .into_parts();
@@ -1089,11 +1150,12 @@ mod tests {
                     publish_provenance: false,
                     reveal_provenance_response: false,
                 }),
+                CancellationToken::new(),
             )
             .await;
 
         assert!(result.is_err());
-        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.ledger_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.capture_calls.load(Ordering::SeqCst), 0);
@@ -1145,10 +1207,12 @@ mod tests {
                 "{control_base}/oauth/introspect"
             ))),
             Arc::new(ResolverCreditsClient::for_tests(control_base)),
+            Arc::new(EgressPolicy::for_tests(&["example.com"], true)),
             Arc::new(FetchFallbackCache::default()),
         );
         let (parts, _) = Request::builder()
             .header(header::AUTHORIZATION, "Bearer mcp-token")
+            .extension(mcp_auth_context())
             .body(())
             .expect("MCP request")
             .into_parts();
@@ -1162,11 +1226,12 @@ mod tests {
                     publish_provenance: false,
                     reveal_provenance_response: false,
                 }),
+                CancellationToken::new(),
             )
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.ledger_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
         assert_eq!(spider_calls.load(Ordering::SeqCst), 0);
@@ -1253,6 +1318,31 @@ mod tests {
         assert!(challenge.contains("scope=\"tool:fetch_source\""));
         assert!(challenge.contains("error=\"invalid_request\""));
         assert!(challenge.contains("error_description=\"missing bearer token\""));
+    }
+
+    #[test]
+    fn tool_dispatch_reuses_middleware_auth_context() {
+        let expected = ResolverAuthContext {
+            access_token: Some("opaque-token".into()),
+            subject: Some("user-a".into()),
+            client_id: Some("connector".into()),
+            scopes: vec!["tool:fetch_source".into()],
+            audiences: vec!["https://resolver.api.livylabs.xyz/mcp".into()],
+            tenant_id: Some("tenant-a".into()),
+            project_id: Some("project-a".into()),
+        };
+        let request = axum::http::Request::builder()
+            .uri("/mcp")
+            .extension(expected.clone())
+            .body(())
+            .expect("request");
+        let (parts, _) = request.into_parts();
+
+        let actual = require_oauth_context(&ResolverAuth::for_tests(), &parts)
+            .expect("auth context lookup")
+            .expect("middleware context");
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
