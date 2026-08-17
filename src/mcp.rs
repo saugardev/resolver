@@ -195,27 +195,9 @@ impl Server {
                 "source_sha256": &source_sha256,
             })
         );
-        if let Err(err) = self.credits.preflight(&auth_context).await {
-            eprintln!(
-                "{}",
-                json!({
-                    "event": "mcp_credit_preflight_failed",
-                    "request_id": crate::security::current_request_id(),
-                    "source_sha256": &source_sha256,
-                    "elapsed_ms": started.elapsed().as_millis(),
-                    "payment_required": err.is_payment_required(),
-                })
-            );
-            let message = if err.is_payment_required() {
-                "Livy payment required"
-            } else {
-                "Livy credit authorization service is unavailable"
-            };
-            return Ok(CallToolResult::error(vec![Content::text(message)]));
-        }
         let cache_key = normalize_fallback_url_key(&url);
         let fallback_reason = self.fallback_cache.lookup(&cache_key);
-        let pending_result = if let Some(reason) = fallback_reason {
+        let (request, route) = if let Some(reason) = fallback_reason {
             eprintln!(
                 "{}",
                 json!({
@@ -226,20 +208,54 @@ impl Server {
                     "source_sha256": &source_sha256,
                 })
             );
-            self.fetcher
-                .prepare_product_fetch(
-                    Fetcher::unblock_request(&url, true),
-                    crate::types::ProductRoute::Unblock,
-                )
-                .await
+            (
+                Fetcher::unblock_request(&url, true),
+                crate::types::ProductRoute::Unblock,
+            )
         } else {
-            self.fetcher
-                .prepare_product_fetch(
-                    Fetcher::fast_request(&url),
-                    crate::types::ProductRoute::Scrape,
-                )
-                .await
+            (
+                Fetcher::fast_request(&url),
+                crate::types::ProductRoute::Scrape,
+            )
         };
+        let logical_request = self
+            .fetcher
+            .product_billing_context(&request, route)
+            .map_err(|_| ErrorData::invalid_params("Invalid fetch execution plan", None))?;
+        let authorization = match self
+            .credits
+            .preflight_fetch_source(
+                &auth_context,
+                &url,
+                &logical_request,
+                idempotency_key.as_deref(),
+            )
+            .await
+        {
+            Ok(authorization) => authorization,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_preflight_failed",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "payment_required": err.is_payment_required(),
+                        "idempotency_conflict": err.is_idempotency_conflict(),
+                    })
+                );
+                let message = if err.is_payment_required() {
+                    "Livy payment required"
+                } else if err.is_idempotency_conflict() {
+                    "Livy idempotency replay cannot be finalized safely"
+                } else {
+                    "Livy credit authorization service is unavailable"
+                };
+                return Ok(CallToolResult::error(vec![Content::text(message)]));
+            }
+        };
+        let pending_result = self.fetcher.prepare_product_fetch(request, route).await;
         let pending = match pending_result {
             Ok(pending) => pending,
             Err(error) => {
@@ -258,11 +274,7 @@ impl Server {
             }
         };
 
-        match self
-            .credits
-            .capture_fetch_source(&auth_context, &url, idempotency_key.as_deref())
-            .await
-        {
+        match self.credits.capture_authorized_request(authorization).await {
             Ok(Some(outcome)) => {
                 eprintln!(
                     "{}",
@@ -296,10 +308,13 @@ impl Server {
                         "source_sha256": &source_sha256,
                         "elapsed_ms": started.elapsed().as_millis(),
                         "payment_required": err.is_payment_required(),
+                        "idempotency_conflict": err.is_idempotency_conflict(),
                     })
                 );
                 let message = if err.is_payment_required() {
                     "Livy payment required".to_string()
+                } else if err.is_idempotency_conflict() {
+                    "Livy idempotency replay cannot be finalized safely".to_string()
                 } else {
                     "Livy credit authorization service is unavailable".to_string()
                 };
@@ -920,6 +935,7 @@ mod tests {
     #[derive(Clone)]
     struct McpBoundaryState {
         auth_calls: Arc<AtomicUsize>,
+        ledger_calls: Arc<AtomicUsize>,
         preflight_calls: Arc<AtomicUsize>,
         capture_calls: Arc<AtomicUsize>,
         balance: i64,
@@ -960,6 +976,11 @@ mod tests {
         }))
     }
 
+    async fn mcp_ledger(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.ledger_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!([]))
+    }
+
     async fn mcp_preflight(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
         state.preflight_calls.fetch_add(1, Ordering::SeqCst);
         Json(json!({
@@ -988,6 +1009,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::for_tests(spider_base, 4096, None));
         let state = McpBoundaryState {
             auth_calls: Arc::new(AtomicUsize::new(0)),
+            ledger_calls: Arc::new(AtomicUsize::new(0)),
             preflight_calls: Arc::new(AtomicUsize::new(0)),
             capture_calls: Arc::new(AtomicUsize::new(0)),
             balance: 10,
@@ -997,6 +1019,10 @@ mod tests {
             .route(
                 "/api/v1/tenants/tenant-a/users/me/credits",
                 get(mcp_preflight),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credit-ledger",
+                get(mcp_ledger),
             )
             .route(
                 "/api/v1/tenants/tenant-a/users/me/credits/debits",
@@ -1030,6 +1056,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.ledger_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.capture_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fetcher.receipt_count(), 0);
@@ -1053,6 +1080,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::for_tests(spider_base, 4096, None));
         let state = McpBoundaryState {
             auth_calls: Arc::new(AtomicUsize::new(0)),
+            ledger_calls: Arc::new(AtomicUsize::new(0)),
             preflight_calls: Arc::new(AtomicUsize::new(0)),
             capture_calls: Arc::new(AtomicUsize::new(0)),
             balance: 0,
@@ -1062,6 +1090,10 @@ mod tests {
             .route(
                 "/api/v1/tenants/tenant-a/users/me/credits",
                 get(mcp_preflight),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credit-ledger",
+                get(mcp_ledger),
             )
             .route(
                 "/api/v1/tenants/tenant-a/users/me/credits/debits",
@@ -1095,6 +1127,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.ledger_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
         assert_eq!(spider_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.capture_calls.load(Ordering::SeqCst), 0);

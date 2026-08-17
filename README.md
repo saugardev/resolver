@@ -157,8 +157,10 @@ Request fields include `source`, `query`/`q`, `mode`, `format`, `proxy`, and
 
 Auto and fast requests perform at most one unblock fallback during the current
 request when the first response is a recognized browser, JavaScript, robots, or
-human-verification challenge. Both attempts share one deadline and only the
-final successful result can create a receipt or provenance record.
+human-verification challenge. HTTP or payload status `401`, `403`, or `429` can
+be challenge-eligible; redirects and `5xx` responses are always terminal even
+when their body contains challenge text. Both attempts share one deadline and
+only the final successful result can create a receipt or provenance record.
 
 Authenticated requests use this billing order: validate the request, perform a
 non-consuming balance/entitlement preflight, obtain and validate a pending
@@ -172,8 +174,18 @@ The current backend does not expose atomic reserve/capture/cancel operations.
 Consequently, the balance can change after preflight, and some valid Spider work
 can be consumed before an authoritative capture loses that race. Closing that
 cost-abuse window requires a backend reservation before Spider, followed by
-capture on success or cancellation on failure; the resolver's current ordering
-is the safest available contract until that backend API exists.
+capture on success or cancellation on failure.
+
+`Idempotency-Key` is scoped to the authenticated tenant, project, and client and
+bound to a canonical fingerprint of the full execution plan. The resolver fails
+closed with `409` when a completed key is replayed because the credit backend can
+return the prior debit but cannot return or authoritatively bind the prior
+resolver result, receipt, and provenance. The complete backend enhancement is an
+atomic operation API that reserves a caller key and fingerprint, captures or
+cancels that reservation, and returns the original resolver result/evidence
+reference on replay. Until it exists, the resolver uses a bounded local conflict
+registry plus the durable debit ledger; cross-process caller-key races and an
+ambiguous capture without a caller key remain residual limitations.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -183,6 +195,7 @@ is the safest available contract until that backend API exists.
 | POST | `/search` | Web search (+ optional page fetch) |
 | POST | `/extract` | Extraction with selectors |
 | POST | `/screenshot` | Capture screenshot |
+| POST | `/snapshot` | Capture raw HTML and screenshot with one resolver receipt |
 | POST | `/fetchfast` | Compat: fast fetch |
 | POST | `/fetchunblock` | Compat: unblock fetch |
 | GET | `/receipt/{id}` | Read receipt |

@@ -11,7 +11,7 @@ use crate::types::{
 use axum::http::header;
 use reqwest::{Client, Response};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use spider_client::{
     CSSSelector, Delay, Engine, IdleNetwork, ProxyType, RequestParams, RequestType, ReturnFormat,
     ReturnFormatHandling, SearchRequestParams, Selector, Timeout, WaitFor,
@@ -247,15 +247,6 @@ pub struct PendingProductFetch {
     data: Value,
 }
 
-impl PendingProductFetch {
-    pub fn source_or_query(&self) -> Option<&str> {
-        self.payload
-            .source
-            .as_deref()
-            .or(self.payload.query.as_deref())
-    }
-}
-
 impl Fetcher {
     pub fn new() -> Self {
         dotenvy::dotenv().ok();
@@ -298,6 +289,111 @@ impl Fetcher {
             .lock()
             .map(|receipts| receipts.len())
             .unwrap_or_default()
+    }
+
+    /// Canonical description of the complete validated execution plan used by
+    /// credit idempotency. Only its SHA-256 fingerprint leaves the resolver.
+    pub fn product_billing_context(
+        &self,
+        payload: &ProductRequest,
+        route: ProductRoute,
+    ) -> Result<Value, FetchError> {
+        payload.validate_for(route)?;
+        let mode = self.resolve_mode(payload.mode, route);
+        let timeout_secs = payload.timeout_secs.unwrap_or(match mode {
+            ProductMode::Unblock => 50,
+            ProductMode::Browser | ProductMode::Crawl | ProductMode::Screenshot => 45,
+            _ => 25,
+        });
+        let source = payload.source.as_deref();
+        let mut attempts = Vec::new();
+
+        let mut push_url_attempt =
+            |endpoint: &str, params: RequestParams, source: &str| -> Result<(), FetchError> {
+                let request = Self::request_with_url(params, source)?;
+                attempts.push(json!({"endpoint": endpoint, "request": request}));
+                Ok(())
+            };
+
+        match route {
+            ProductRoute::Search => {
+                let query = payload
+                    .query
+                    .as_deref()
+                    .ok_or_else(|| FetchError::BadRequest("search requires `query`".to_string()))?;
+                attempts.push(json!({
+                    "endpoint": "search",
+                    "request": Self::search_request(query, payload)?,
+                }));
+            }
+            ProductRoute::Map => push_url_attempt(
+                "links",
+                self.request_params(payload, ProductMode::Map),
+                source.expect("validated source"),
+            )?,
+            ProductRoute::Crawl => push_url_attempt(
+                "crawl",
+                self.request_params(payload, ProductMode::Crawl),
+                source.expect("validated source"),
+            )?,
+            ProductRoute::Screenshot => {
+                let mut params = self.request_params(payload, ProductMode::Screenshot);
+                params.return_format = Some(ReturnFormatHandling::Single(ReturnFormat::Screenshot));
+                push_url_attempt("screenshot", params, source.expect("validated source"))?;
+            }
+            ProductRoute::Snapshot => push_url_attempt(
+                "scrape",
+                Self::snapshot_params(),
+                source.expect("validated source"),
+            )?,
+            ProductRoute::Unblock => push_url_attempt(
+                "unblocker",
+                self.request_params(payload, ProductMode::Unblock),
+                source.expect("validated source"),
+            )?,
+            ProductRoute::Extract | ProductRoute::Scrape => {
+                let source = source.expect("validated source");
+                if mode == ProductMode::Unblock {
+                    push_url_attempt(
+                        "unblocker",
+                        self.request_params(payload, ProductMode::Unblock),
+                        source,
+                    )?;
+                } else {
+                    push_url_attempt("scrape", self.request_params(payload, mode), source)?;
+                    if matches!(mode, ProductMode::Auto | ProductMode::Fast) {
+                        push_url_attempt(
+                            "unblocker",
+                            self.request_params(payload, ProductMode::Unblock),
+                            source,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        for attempt in &mut attempts {
+            stabilize_unordered_wire_fields(attempt);
+        }
+        Ok(json!({
+            "contract": "livy-resolver-logical-request-v1",
+            "kind": "product",
+            "route": route.as_str(),
+            "resolved_mode": mode,
+            "outer_timeout_secs": timeout_secs,
+            "receipt": payload.receipt,
+            "validated_request": payload,
+            "attempts": attempts,
+        }))
+    }
+
+    pub fn receipt_billing_context(receipt_id: &str) -> Value {
+        json!({
+            "contract": "livy-resolver-logical-request-v1",
+            "kind": "receipt_read",
+            "route": "receipt",
+            "receipt_id": receipt_id,
+        })
     }
 
     #[cfg(test)]
@@ -346,6 +442,10 @@ impl Fetcher {
                 let source = Self::source(&payload)?;
                 (self.screenshot(source, &payload, deadline).await?, mode)
             }
+            ProductRoute::Snapshot => {
+                let source = Self::source(&payload)?;
+                (self.snapshot(source, deadline).await?, mode)
+            }
             ProductRoute::Unblock => {
                 let source = Self::source(&payload)?;
                 (self.unblock(source, &payload, deadline).await?, mode)
@@ -364,6 +464,9 @@ impl Fetcher {
         };
 
         let data = Self::ensure_spider_success(data)?;
+        if route == ProductRoute::Snapshot {
+            SnapshotPayload::validate_spider_response(&data).map_err(FetchError::Snapshot)?;
+        }
 
         Ok(PendingProductFetch {
             payload,
@@ -467,9 +570,21 @@ impl Fetcher {
         payload
     }
 
-    pub async fn prepare_snapshot(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
+    pub fn snapshot_request(source: &str) -> ProductRequest {
+        let mut payload = ProductRequest::legacy(source);
+        payload.mode = ProductMode::Screenshot;
+        payload.formats = Some(vec![ProductFormat::Raw, ProductFormat::Screenshot]);
+        payload.proxy = Some(ProductProxy::Isp);
+        payload.receipt = Some(true);
+        payload.stealth = Some(true);
+        payload.fingerprint = Some(true);
+        payload.timeout_secs = Some(50);
+        payload
+    }
+
+    fn snapshot_params() -> RequestParams {
         let formats = HashSet::from([ReturnFormat::Raw, ReturnFormat::Screenshot]);
-        let params = RequestParams {
+        RequestParams {
             return_format: Some(ReturnFormatHandling::Multi(formats)),
             request: Some(RequestType::SmartMode),
             stealth: Some(true),
@@ -477,14 +592,7 @@ impl Fetcher {
             proxy: Some(ProxyType::Isp),
             proxy_enabled: None,
             ..Default::default()
-        };
-
-        let request = Self::request_with_url(params, source)?;
-        let deadline = Instant::now() + Duration::from_secs(50);
-        let data = self.spider.post("scrape", &request, deadline).await?;
-        let crawl = Self::ensure_spider_success(Self::normalize_value(data)?)?;
-
-        SnapshotPayload::from_spider_response(source, crawl).map_err(FetchError::Snapshot)
+        }
     }
 
     async fn provenance_for(
@@ -587,6 +695,11 @@ impl Fetcher {
         Self::normalize_value(self.spider.post("unblocker", &request, deadline).await?)
     }
 
+    async fn snapshot(&self, source: &str, deadline: Instant) -> Result<Value, FetchError> {
+        let request = Self::request_with_url(Self::snapshot_params(), source)?;
+        Self::normalize_value(self.spider.post("scrape", &request, deadline).await?)
+    }
+
     async fn crawl(
         &self,
         source: &str,
@@ -627,8 +740,13 @@ impl Fetcher {
         payload: &ProductRequest,
         deadline: Instant,
     ) -> Result<Value, FetchError> {
-        let base = self.request_params(payload, ProductMode::Search);
-        let params = SearchRequestParams {
+        let request = Self::search_request(query, payload)?;
+        Self::normalize_value(self.spider.post("search", &request, deadline).await?)
+    }
+
+    fn search_request(query: &str, payload: &ProductRequest) -> Result<Value, FetchError> {
+        let base = Self::request_params_static(payload, ProductMode::Search);
+        Self::request_value(SearchRequestParams {
             base,
             search: query.to_string(),
             search_limit: payload.search_limit.or(payload.limit),
@@ -637,9 +755,7 @@ impl Fetcher {
             quick_search: payload.quick_search,
             engine: payload.engine.as_deref().and_then(parse_engine),
             ..Default::default()
-        };
-        let request = Self::request_value(params)?;
-        Self::normalize_value(self.spider.post("search", &request, deadline).await?)
+        })
     }
 
     /// Resolve the route into the mode that should be executed.
@@ -650,6 +766,7 @@ impl Fetcher {
             ProductRoute::Search => ProductMode::Search,
             ProductRoute::Extract => ProductMode::Extract,
             ProductRoute::Screenshot => ProductMode::Screenshot,
+            ProductRoute::Snapshot => ProductMode::Screenshot,
             ProductRoute::Unblock => ProductMode::Unblock,
             ProductRoute::Scrape => mode,
         }
@@ -680,6 +797,10 @@ impl Fetcher {
 
     /// Build Spider request params from product options.
     fn request_params(&self, payload: &ProductRequest, mode: ProductMode) -> RequestParams {
+        Self::request_params_static(payload, mode)
+    }
+
+    fn request_params_static(payload: &ProductRequest, mode: ProductMode) -> RequestParams {
         RequestParams {
             request: Some(Self::request_type(mode)),
             return_format: Some(Self::return_format(payload, mode)),
@@ -1063,6 +1184,27 @@ impl Fetcher {
     }
 }
 
+fn stabilize_unordered_wire_fields(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                stabilize_unordered_wire_fields(value);
+                if key == "return_format"
+                    && let Value::Array(values) = value
+                {
+                    values.sort_by_key(Value::to_string);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                stabilize_unordered_wire_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn spider_payload_status(value: &Value) -> Option<i64> {
     value
         .as_i64()
@@ -1082,17 +1224,42 @@ fn bounded_diagnostic(value: &str) -> String {
 
 pub(crate) fn fallback_reason_for_fetch_error(error: &FetchError) -> Option<&'static str> {
     match error {
-        FetchError::Upstream(detail) => fallback_reason_for_text(detail),
-        FetchError::UpstreamStatus { body, .. } => fallback_reason_for_text(body),
-        FetchError::UpstreamPayload { error, content, .. } => error
-            .as_deref()
-            .and_then(fallback_reason_for_text)
-            .or_else(|| content.as_deref().and_then(fallback_reason_for_text)),
+        FetchError::UpstreamStatus { status, body }
+            if matches!(status.as_u16(), 401 | 403 | 429) =>
+        {
+            fallback_reason_for_text(body)
+        }
+        FetchError::UpstreamPayload {
+            status,
+            error,
+            content,
+        } if status.is_none_or(|status| {
+            (200..=299).contains(&status) || matches!(status, 401 | 403 | 429)
+        }) =>
+        {
+            error
+                .as_deref()
+                .and_then(fallback_reason_for_text)
+                .or_else(|| content.as_deref().and_then(fallback_reason_for_text))
+        }
         _ => None,
     }
 }
 
 pub(crate) fn fallback_reason_for_fetch_data(data: &Value) -> Option<&'static str> {
+    let statuses_are_successful = data
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(data))
+        .iter()
+        .all(|item| {
+            item.get("status")
+                .and_then(spider_payload_status)
+                .is_none_or(|status| (200..=299).contains(&status))
+        });
+    if !statuses_are_successful {
+        return None;
+    }
     if let Some(content) = extracted_content(data) {
         return fallback_reason_for_text(content);
     }
@@ -1244,9 +1411,14 @@ mod tests {
             ProductRoute::Search,
             ProductRoute::Extract,
             ProductRoute::Screenshot,
+            ProductRoute::Snapshot,
             ProductRoute::Unblock,
         ] {
-            let mut request = ProductRequest::legacy("https://example.com");
+            let mut request = if route == ProductRoute::Snapshot {
+                Fetcher::snapshot_request("https://example.com")
+            } else {
+                ProductRequest::legacy("https://example.com")
+            };
             request.receipt = Some(true);
             if route == ProductRoute::Search {
                 request.query = Some("resolver test".to_string());
@@ -1263,16 +1435,6 @@ mod tests {
                     if status == StatusCode::INTERNAL_SERVER_ERROR
             ));
         }
-
-        let snapshot_error = fetcher
-            .prepare_snapshot("https://example.com")
-            .await
-            .expect_err("snapshot HTTP 500 must fail");
-        assert!(matches!(
-            snapshot_error,
-            FetchError::UpstreamStatus { status, .. }
-                if status == StatusCode::INTERNAL_SERVER_ERROR
-        ));
         assert!(fetcher.receipts.lock().expect("receipts").is_empty());
     }
 
@@ -1439,6 +1601,54 @@ mod tests {
         assert_eq!(scrape_calls.load(Ordering::SeqCst), 1);
         assert_eq!(unblock_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fetcher.receipt_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn payload_redirects_and_server_errors_never_trigger_challenge_fallback() {
+        for status in [301, 302, 307, 308, 500, 502] {
+            let unblock_calls = Arc::new(AtomicUsize::new(0));
+            let unblock_counter = unblock_calls.clone();
+            let router = Router::new()
+                .route(
+                    "/scrape",
+                    post(move || async move {
+                        Json(json!([{
+                            "status": status,
+                            "content": "captcha verification required"
+                        }]))
+                    }),
+                )
+                .route(
+                    "/unblocker",
+                    post(move || {
+                        let calls = unblock_counter.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Json(json!([{"status": 200, "content": "must not run"}]))
+                        }
+                    }),
+                );
+            let fetcher = test_fetcher(spawn_mock(router).await, 4096);
+
+            let error = fetcher
+                .prepare_product_fetch(
+                    ProductRequest::fast("https://example.com"),
+                    ProductRoute::Scrape,
+                )
+                .await
+                .err()
+                .expect("redirect and server payload statuses must fail");
+
+            assert!(matches!(
+                error,
+                FetchError::UpstreamPayload {
+                    status: Some(actual),
+                    ..
+                } if actual == status
+            ));
+            assert_eq!(unblock_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fetcher.receipt_count(), 0);
+        }
     }
 
     #[tokio::test]

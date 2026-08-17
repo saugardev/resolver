@@ -98,7 +98,7 @@ pub enum ProductFormat {
 }
 
 /// Single or multiple output format selection.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum FormatSelection {
     /// One requested format.
@@ -124,7 +124,7 @@ pub enum ProductProxy {
 }
 
 /// Product API request accepted by route handlers.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProductRequest {
     /// Exact URL to fetch, crawl, map, extract, or screenshot.
     #[serde(alias = "url")]
@@ -392,6 +392,7 @@ fn validate_mode_for_route(
         ProductRoute::Screenshot => {
             matches!(mode, ProductMode::Auto | ProductMode::Screenshot)
         }
+        ProductRoute::Snapshot => matches!(mode, ProductMode::Screenshot),
         ProductRoute::Unblock => matches!(mode, ProductMode::Auto | ProductMode::Unblock),
     };
 
@@ -623,6 +624,8 @@ pub enum ProductRoute {
     Extract,
     /// Screenshot capture.
     Screenshot,
+    /// Raw HTML plus screenshot snapshot capture.
+    Snapshot,
     /// Stealth unblock fetch.
     Unblock,
 }
@@ -637,6 +640,7 @@ impl ProductRoute {
             Self::Search => "search",
             Self::Extract => "extract",
             Self::Screenshot => "screenshot",
+            Self::Snapshot => "snapshot",
             Self::Unblock => "unblock",
         }
     }

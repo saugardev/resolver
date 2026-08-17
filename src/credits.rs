@@ -5,14 +5,20 @@ use crate::errors::ResolverCreditsError;
 use livy_provenance_sdk::DEFAULT_LIVY_API_BASE_URL;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 static IDEMPOTENCY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const PRICING_VERSION: &str = "resolver-pricing-v1";
+const IDEMPOTENCY_BINDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const IDEMPOTENCY_BINDING_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct ResolverCreditsClient {
@@ -20,6 +26,98 @@ pub struct ResolverCreditsClient {
     backend_base_url: String,
     amount: i64,
     http: reqwest::Client,
+    idempotency_bindings: IdempotencyBindingRegistry,
+}
+
+#[derive(Debug, Clone)]
+struct IdempotencyBindingRegistry {
+    entries: Arc<Mutex<HashMap<String, IdempotencyBinding>>>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IdempotencyBinding {
+    request_fingerprint: String,
+    inserted_at: Instant,
+    captured: bool,
+}
+
+impl Default for IdempotencyBindingRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            ttl: IDEMPOTENCY_BINDING_TTL,
+            max_entries: IDEMPOTENCY_BINDING_MAX_ENTRIES,
+        }
+    }
+}
+
+impl IdempotencyBindingRegistry {
+    fn bind(
+        &self,
+        caller_scope: &str,
+        request_fingerprint: &str,
+    ) -> Result<bool, ResolverCreditsError> {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ResolverCreditsError::IdempotencyRegistry("lock poisoned".into()))?;
+        self.prune_locked(&mut entries, now);
+
+        if let Some(existing) = entries.get(caller_scope) {
+            return if existing.request_fingerprint == request_fingerprint {
+                Ok(existing.captured)
+            } else {
+                Err(ResolverCreditsError::IdempotencyConflict)
+            };
+        }
+
+        entries.insert(
+            caller_scope.to_string(),
+            IdempotencyBinding {
+                request_fingerprint: request_fingerprint.to_string(),
+                inserted_at: now,
+                captured: false,
+            },
+        );
+        self.prune_locked(&mut entries, now);
+        Ok(false)
+    }
+
+    fn mark_captured(
+        &self,
+        caller_scope: &str,
+        request_fingerprint: &str,
+    ) -> Result<(), ResolverCreditsError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ResolverCreditsError::IdempotencyRegistry("lock poisoned".into()))?;
+        let entry = entries
+            .get_mut(caller_scope)
+            .ok_or_else(|| ResolverCreditsError::IdempotencyRegistry("binding missing".into()))?;
+        if entry.request_fingerprint != request_fingerprint {
+            return Err(ResolverCreditsError::IdempotencyConflict);
+        }
+        entry.captured = true;
+        Ok(())
+    }
+
+    fn prune_locked(&self, entries: &mut HashMap<String, IdempotencyBinding>, now: Instant) {
+        entries.retain(|_, entry| now.duration_since(entry.inserted_at) <= self.ttl);
+        while entries.len() > self.max_entries {
+            let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            entries.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -30,6 +128,47 @@ pub struct ResolverCreditDebitOutcome {
     pub amount: i64,
     #[serde(default)]
     pub reason: Option<String>,
+    pub ledger_entry: Option<ResolverCreditLedgerEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolverCreditLedgerEntry {
+    tenant_id: String,
+    project_id: Option<String>,
+    entry_type: String,
+    amount_delta: i64,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    metadata: Value,
+}
+
+#[derive(Debug)]
+pub struct ResolverCreditAuthorization {
+    access_token: String,
+    tenant_id: String,
+    project_id: String,
+    amount: i64,
+    reason: String,
+    idempotency_key: String,
+    caller_scope: Option<String>,
+    request_fingerprint: String,
+    capture_attempt_id: String,
+    metadata: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingCallerBinding {
+    None,
+    ExactReplay,
+    Conflict,
+}
+
+struct ExistingCallerBindingQuery<'a> {
+    project_id: &'a str,
+    client_id: Option<&'a str>,
+    caller_key_sha256: &'a str,
+    idempotency_key: &'a str,
+    request_fingerprint: &'a str,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,54 +187,30 @@ impl ResolverCreditsClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("resolver credits HTTP client should initialize"),
+            idempotency_bindings: IdempotencyBindingRegistry::default(),
         }
     }
 
-    /// Verify credit entitlement without consuming credits.
-    ///
-    /// This deliberately remains a preflight rather than a reservation. The
-    /// debit after upstream success is authoritative because the balance can
-    /// change between these two calls.
-    pub async fn preflight(
+    pub async fn preflight_fetch_source(
         &self,
         auth_context: &ResolverAuthContext,
-    ) -> Result<(), ResolverCreditsError> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let Some(access_token) = auth_context.access_token.as_deref() else {
-            return Ok(());
-        };
-        let tenant_id = auth_context
-            .tenant_id
-            .as_deref()
-            .ok_or(ResolverCreditsError::MissingAuth("tenant_id"))?;
-        let response = self
-            .http
-            .get(self.balance_endpoint(tenant_id))
-            .headers(self.headers(access_token)?)
-            .send()
-            .await
-            .map_err(ResolverCreditsError::Http)?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ResolverCreditsError::Backend { status, body });
-        }
-
-        let balance = response
-            .json::<ResolverCreditBalance>()
-            .await
-            .map_err(ResolverCreditsError::Http)?;
-        if balance.balance < self.amount {
-            return Err(ResolverCreditsError::InsufficientCredits {
-                available: balance.balance,
-                required: self.amount,
-            });
-        }
-        Ok(())
+        source_url: &str,
+        logical_request: &Value,
+        requested_idempotency_key: Option<&str>,
+    ) -> Result<Option<ResolverCreditAuthorization>, ResolverCreditsError> {
+        self.preflight_request(
+            auth_context,
+            ResolverCreditRequest {
+                reason: "resolver.fetch_source",
+                route: "mcp.fetch_source",
+                source_url: Some(source_url),
+                subject_id: None,
+                logical_request,
+                requested_idempotency_key,
+                metadata: json!({"tool": "fetch_source"}),
+            },
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -109,75 +224,109 @@ impl ResolverCreditsClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("test credits client"),
+            idempotency_bindings: IdempotencyBindingRegistry::default(),
         }
     }
 
-    /// Capture a fetch-source charge after the upstream result is validated.
-    pub async fn capture_fetch_source(
-        &self,
-        auth_context: &ResolverAuthContext,
-        source_url: &str,
-        requested_idempotency_key: Option<&str>,
-    ) -> Result<Option<ResolverCreditDebitOutcome>, ResolverCreditsError> {
-        self.debit_request(
-            auth_context,
-            ResolverCreditRequest {
-                reason: "resolver.fetch_source",
-                route: "mcp.fetch_source",
-                source_url: Some(source_url),
-                subject_id: None,
-                requested_idempotency_key,
-                metadata: json!({
-                    "tool": "fetch_source",
-                }),
-            },
-        )
-        .await
-    }
-
-    /// Capture a product charge after the upstream result is validated.
-    pub async fn capture_product_request(
+    pub async fn preflight_product_request(
         &self,
         auth_context: &ResolverAuthContext,
         route: &str,
         source_url: Option<&str>,
         subject_id: Option<&str>,
+        logical_request: &Value,
         requested_idempotency_key: Option<&str>,
-    ) -> Result<Option<ResolverCreditDebitOutcome>, ResolverCreditsError> {
-        self.debit_request(
+    ) -> Result<Option<ResolverCreditAuthorization>, ResolverCreditsError> {
+        self.preflight_request(
             auth_context,
             ResolverCreditRequest {
                 reason: "resolver.product_request",
                 route,
                 source_url,
                 subject_id,
+                logical_request,
                 requested_idempotency_key,
-                metadata: json!({
-                    "product_route": route,
-                }),
+                metadata: json!({"product_route": route}),
             },
         )
         .await
     }
 
-    async fn debit_request(
+    async fn preflight_request(
         &self,
         auth_context: &ResolverAuthContext,
         request: ResolverCreditRequest<'_>,
-    ) -> Result<Option<ResolverCreditDebitOutcome>, ResolverCreditsError> {
+    ) -> Result<Option<ResolverCreditAuthorization>, ResolverCreditsError> {
         if !self.enabled {
             return Ok(None);
         }
 
-        let Some(access_token) = auth_context.access_token.as_deref() else {
-            return Ok(None);
-        };
+        let access_token = auth_context
+            .access_token
+            .as_deref()
+            .ok_or(ResolverCreditsError::MissingAuth("access_token"))?;
         let tenant_id = auth_context
             .tenant_id
             .as_deref()
             .ok_or(ResolverCreditsError::MissingAuth("tenant_id"))?;
-        let project_id = auth_context.project_id.as_deref();
-        let idempotency_key = resolver_request_idempotency_key(&request, auth_context);
+        let project_id = auth_context
+            .project_id
+            .as_deref()
+            .ok_or(ResolverCreditsError::MissingAuth("project_id"))?;
+        let request_fingerprint =
+            resolver_request_fingerprint(&request, auth_context, self.amount)?;
+        let requested_idempotency_key = request
+            .requested_idempotency_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let idempotency_key = resolver_request_idempotency_key(
+            request.route,
+            &request_fingerprint,
+            requested_idempotency_key.is_some(),
+        );
+        let mut caller_scope = None;
+        if let Some(requested) = requested_idempotency_key {
+            let scope = caller_idempotency_scope(auth_context, requested)?;
+            if self
+                .idempotency_bindings
+                .bind(&scope, &request_fingerprint)?
+            {
+                return Err(ResolverCreditsError::UnsafeReplay);
+            }
+            caller_scope = Some(scope);
+            let caller_key_sha256 = sha256_hex(requested.as_bytes());
+            match self
+                .existing_caller_binding(
+                    tenant_id,
+                    access_token,
+                    ExistingCallerBindingQuery {
+                        project_id,
+                        client_id: auth_context.client_id.as_deref(),
+                        caller_key_sha256: &caller_key_sha256,
+                        idempotency_key: &idempotency_key,
+                        request_fingerprint: &request_fingerprint,
+                    },
+                )
+                .await?
+            {
+                ExistingCallerBinding::None => {}
+                ExistingCallerBinding::ExactReplay => {
+                    if let Some(scope) = caller_scope.as_deref() {
+                        self.idempotency_bindings
+                            .mark_captured(scope, &request_fingerprint)?;
+                    }
+                    return Err(ResolverCreditsError::UnsafeReplay);
+                }
+                ExistingCallerBinding::Conflict => {
+                    return Err(ResolverCreditsError::IdempotencyConflict);
+                }
+            }
+        }
+
+        self.require_available_balance(tenant_id, access_token, self.amount)
+            .await?;
+
+        let capture_attempt_id = Uuid::new_v4().to_string();
         let source_sha256 = request
             .source_url
             .map(|source_url| sha256_hex(source_url.as_bytes()));
@@ -190,6 +339,18 @@ impl ResolverCreditsClient {
         );
         metadata.insert("scopes".to_string(), json!(&auth_context.scopes));
         metadata.insert("audiences".to_string(), json!(&auth_context.audiences));
+        metadata.insert(
+            "request_fingerprint".to_string(),
+            json!(&request_fingerprint),
+        );
+        metadata.insert("pricing_version".to_string(), json!(PRICING_VERSION));
+        metadata.insert("capture_attempt_id".to_string(), json!(&capture_attempt_id));
+        if let Some(requested) = requested_idempotency_key {
+            metadata.insert(
+                "caller_idempotency_key_sha256".to_string(),
+                json!(sha256_hex(requested.as_bytes())),
+            );
+        }
         if let Some(source_sha256) = source_sha256 {
             metadata.insert("source_sha256".to_string(), json!(source_sha256));
         }
@@ -197,16 +358,37 @@ impl ResolverCreditsClient {
             metadata.insert("subject_id".to_string(), json!(subject_id));
         }
 
+        Ok(Some(ResolverCreditAuthorization {
+            access_token: access_token.to_string(),
+            tenant_id: tenant_id.to_string(),
+            project_id: project_id.to_string(),
+            amount: self.amount,
+            reason: request.reason.to_string(),
+            idempotency_key,
+            caller_scope,
+            request_fingerprint,
+            capture_attempt_id,
+            metadata,
+        }))
+    }
+
+    pub async fn capture_authorized_request(
+        &self,
+        authorization: Option<ResolverCreditAuthorization>,
+    ) -> Result<Option<ResolverCreditDebitOutcome>, ResolverCreditsError> {
+        let Some(authorization) = authorization else {
+            return Ok(None);
+        };
         let response = self
             .http
-            .post(self.debit_endpoint(tenant_id))
-            .headers(self.headers(access_token)?)
+            .post(self.debit_endpoint(&authorization.tenant_id))
+            .headers(self.headers(&authorization.access_token)?)
             .json(&json!({
-                "amount": self.amount,
-                "project_id": project_id,
-                "idempotency_key": idempotency_key,
-                "reason": request.reason,
-                "metadata": metadata
+                "amount": authorization.amount,
+                "project_id": authorization.project_id,
+                "idempotency_key": authorization.idempotency_key,
+                "reason": authorization.reason,
+                "metadata": authorization.metadata,
             }))
             .send()
             .await
@@ -222,14 +404,113 @@ impl ResolverCreditsClient {
             .json::<ResolverCreditDebitOutcome>()
             .await
             .map_err(ResolverCreditsError::Http)?;
-        if !outcome.charged || outcome.amount != self.amount {
+        if !outcome.charged || !outcome.enforced || outcome.amount != authorization.amount {
             return Err(ResolverCreditsError::CaptureNotApplied(
                 outcome.reason.clone().unwrap_or_else(|| {
-                    "backend returned an uncharged or mismatched outcome".into()
+                    "backend returned an uncharged, unenforced, or mismatched outcome".into()
                 }),
             ));
         }
+
+        let ledger = outcome.ledger_entry.as_ref().ok_or_else(|| {
+            ResolverCreditsError::CaptureNotApplied(
+                "backend did not return a request-bound ledger entry".into(),
+            )
+        })?;
+        validate_capture_binding(ledger, &authorization)?;
+        let replayed = ledger
+            .metadata
+            .get("capture_attempt_id")
+            .and_then(Value::as_str)
+            != Some(authorization.capture_attempt_id.as_str());
+        if let Some(scope) = authorization.caller_scope.as_deref() {
+            self.idempotency_bindings
+                .mark_captured(scope, &authorization.request_fingerprint)?;
+        }
+        if replayed {
+            return Err(ResolverCreditsError::UnsafeReplay);
+        }
         Ok(Some(outcome))
+    }
+
+    async fn require_available_balance(
+        &self,
+        tenant_id: &str,
+        access_token: &str,
+        amount: i64,
+    ) -> Result<(), ResolverCreditsError> {
+        let response = self
+            .http
+            .get(self.balance_endpoint(tenant_id))
+            .headers(self.headers(access_token)?)
+            .send()
+            .await
+            .map_err(ResolverCreditsError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ResolverCreditsError::Backend { status, body });
+        }
+        let balance = response
+            .json::<ResolverCreditBalance>()
+            .await
+            .map_err(ResolverCreditsError::Http)?;
+        if balance.balance < amount {
+            return Err(ResolverCreditsError::InsufficientCredits {
+                available: balance.balance,
+                required: amount,
+            });
+        }
+        Ok(())
+    }
+
+    async fn existing_caller_binding(
+        &self,
+        tenant_id: &str,
+        access_token: &str,
+        query: ExistingCallerBindingQuery<'_>,
+    ) -> Result<ExistingCallerBinding, ResolverCreditsError> {
+        let response = self
+            .http
+            .get(self.ledger_endpoint(tenant_id))
+            .headers(self.headers(access_token)?)
+            .send()
+            .await
+            .map_err(ResolverCreditsError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ResolverCreditsError::Backend { status, body });
+        }
+        let entries = response
+            .json::<Vec<ResolverCreditLedgerEntry>>()
+            .await
+            .map_err(ResolverCreditsError::Http)?;
+        for entry in entries {
+            let caller_binding_matches = entry.entry_type == "debit"
+                && entry.project_id.as_deref() == Some(query.project_id)
+                && entry.metadata.get("client_id").and_then(Value::as_str) == query.client_id
+                && entry
+                    .metadata
+                    .get("caller_idempotency_key_sha256")
+                    .and_then(Value::as_str)
+                    == Some(query.caller_key_sha256);
+            if !caller_binding_matches {
+                continue;
+            }
+            let exact = entry.idempotency_key.as_deref() == Some(query.idempotency_key)
+                && entry
+                    .metadata
+                    .get("request_fingerprint")
+                    .and_then(Value::as_str)
+                    == Some(query.request_fingerprint);
+            return Ok(if exact {
+                ExistingCallerBinding::ExactReplay
+            } else {
+                ExistingCallerBinding::Conflict
+            });
+        }
+        Ok(ExistingCallerBinding::None)
     }
 
     fn balance_endpoint(&self, tenant_id: &str) -> String {
@@ -242,6 +523,13 @@ impl ResolverCreditsClient {
     fn debit_endpoint(&self, tenant_id: &str) -> String {
         format!(
             "{}/api/v1/tenants/{}/users/me/credits/debits",
+            self.backend_base_url, tenant_id
+        )
+    }
+
+    fn ledger_endpoint(&self, tenant_id: &str) -> String {
+        format!(
+            "{}/api/v1/tenants/{}/users/me/credit-ledger",
             self.backend_base_url, tenant_id
         )
     }
@@ -261,20 +549,55 @@ struct ResolverCreditRequest<'a> {
     route: &'a str,
     source_url: Option<&'a str>,
     subject_id: Option<&'a str>,
+    logical_request: &'a Value,
     requested_idempotency_key: Option<&'a str>,
-    metadata: serde_json::Value,
+    metadata: Value,
+}
+
+fn resolver_request_fingerprint(
+    request: &ResolverCreditRequest<'_>,
+    auth_context: &ResolverAuthContext,
+    amount: i64,
+) -> Result<String, ResolverCreditsError> {
+    let material = json!({
+        "contract": "livy-resolver-debit-fingerprint-v1",
+        "tenant_id": auth_context.tenant_id.as_deref(),
+        "project_id": auth_context.project_id.as_deref(),
+        "client_id": auth_context.client_id.as_deref(),
+        "reason": request.reason,
+        "route": request.route,
+        "amount": amount,
+        "pricing_version": PRICING_VERSION,
+        "caller_idempotency_key": request
+            .requested_idempotency_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        "logical_request": request.logical_request,
+    });
+    Ok(sha256_hex(&canonical_json_bytes(&material)?))
+}
+
+fn caller_idempotency_scope(
+    auth_context: &ResolverAuthContext,
+    requested_idempotency_key: &str,
+) -> Result<String, ResolverCreditsError> {
+    let material = json!({
+        "contract": "livy-resolver-caller-idempotency-scope-v1",
+        "tenant_id": auth_context.tenant_id.as_deref(),
+        "project_id": auth_context.project_id.as_deref(),
+        "client_id": auth_context.client_id.as_deref(),
+        "caller_idempotency_key": requested_idempotency_key,
+    });
+    Ok(sha256_hex(&canonical_json_bytes(&material)?))
 }
 
 fn resolver_request_idempotency_key(
-    request: &ResolverCreditRequest<'_>,
-    auth_context: &ResolverAuthContext,
+    route: &str,
+    request_fingerprint: &str,
+    caller_key_present: bool,
 ) -> String {
-    if let Some(requested) = request
-        .requested_idempotency_key
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return format!("resolver_{}:{requested}", key_segment(request.route));
+    if caller_key_present {
+        return format!("resolver_{}:{request_fingerprint}", key_segment(route));
     }
 
     let nonce = SystemTime::now()
@@ -283,21 +606,67 @@ fn resolver_request_idempotency_key(
         .unwrap_or_default();
     let sequence = IDEMPOTENCY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let material = json!({
-        "tenant_id": auth_context.tenant_id.as_deref(),
-        "project_id": auth_context.project_id.as_deref(),
-        "client_id": auth_context.client_id.as_deref(),
-        "route": request.route,
-        "reason": request.reason,
-        "source_sha256": request.source_url.map(|source_url| sha256_hex(source_url.as_bytes())),
-        "subject_id": request.subject_id,
+        "request_fingerprint": request_fingerprint,
         "nonce": nonce,
         "sequence": sequence,
     });
     format!(
         "resolver_{}:{}",
-        key_segment(request.route),
-        sha256_hex(material.to_string().as_bytes())
+        key_segment(route),
+        sha256_hex(canonical_json(&material).to_string().as_bytes())
     )
+}
+
+fn validate_capture_binding(
+    ledger: &ResolverCreditLedgerEntry,
+    authorization: &ResolverCreditAuthorization,
+) -> Result<(), ResolverCreditsError> {
+    let valid = ledger.tenant_id == authorization.tenant_id
+        && ledger.project_id.as_deref() == Some(authorization.project_id.as_str())
+        && ledger.entry_type == "debit"
+        && ledger.amount_delta == -authorization.amount
+        && ledger.idempotency_key.as_deref() == Some(authorization.idempotency_key.as_str())
+        && ledger
+            .metadata
+            .get("request_fingerprint")
+            .and_then(Value::as_str)
+            == Some(authorization.request_fingerprint.as_str())
+        && ledger
+            .metadata
+            .get("pricing_version")
+            .and_then(Value::as_str)
+            == Some(PRICING_VERSION);
+    if valid {
+        Ok(())
+    } else {
+        Err(ResolverCreditsError::CaptureNotApplied(
+            "backend debit outcome was not bound to the authorized request".into(),
+        ))
+    }
+}
+
+fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, ResolverCreditsError> {
+    serde_json::to_vec(&canonical_json(value)).map_err(|err| {
+        ResolverCreditsError::IdempotencyRegistry(format!(
+            "logical request canonicalization failed: {err}"
+        ))
+    })
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
 }
 
 fn object_or_empty(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -364,55 +733,146 @@ mod tests {
     use super::*;
     use reqwest::StatusCode;
 
-    #[test]
-    fn idempotency_key_uses_client_supplied_value_when_present() {
-        let auth = ResolverAuthContext {
+    fn auth(project_id: &str) -> ResolverAuthContext {
+        ResolverAuthContext {
             access_token: Some("token".to_string()),
             client_id: Some("client".to_string()),
             scopes: vec!["tool:fetch_source".to_string()],
             audiences: Vec::new(),
             tenant_id: Some("tenant-a".to_string()),
-            project_id: Some("project-a".to_string()),
-        };
+            project_id: Some(project_id.to_string()),
+        }
+    }
 
+    fn request<'a>(logical_request: &'a Value, key: Option<&'a str>) -> ResolverCreditRequest<'a> {
+        ResolverCreditRequest {
+            reason: "resolver.fetch_source",
+            route: "mcp.fetch_source",
+            source_url: logical_request.get("source").and_then(Value::as_str),
+            subject_id: None,
+            logical_request,
+            requested_idempotency_key: key,
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn fingerprint_and_backend_key_bind_source_project_and_caller_key() {
+        let first_logical = json!({"source": "https://example.com/a", "mode": "fast"});
+        let reordered = json!({"mode": "fast", "source": "https://example.com/a"});
+        let changed_source = json!({"source": "https://example.com/b", "mode": "fast"});
+        let first = resolver_request_fingerprint(
+            &request(&first_logical, Some("retry-1")),
+            &auth("project-a"),
+            1,
+        )
+        .unwrap();
         assert_eq!(
-            resolver_request_idempotency_key(
-                &ResolverCreditRequest {
-                    reason: "resolver.fetch_source",
-                    route: "mcp.fetch_source",
-                    source_url: Some("https://example.com"),
-                    subject_id: None,
-                    requested_idempotency_key: Some(" request-1 "),
-                    metadata: json!({}),
-                },
-                &auth,
-            ),
-            "resolver_mcp_fetch_source:request-1"
+            first,
+            resolver_request_fingerprint(
+                &request(&reordered, Some("retry-1")),
+                &auth("project-a"),
+                1,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            resolver_request_fingerprint(
+                &request(&changed_source, Some("retry-1")),
+                &auth("project-a"),
+                1,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            resolver_request_fingerprint(
+                &request(&first_logical, Some("retry-1")),
+                &auth("project-b"),
+                1,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            resolver_request_fingerprint(
+                &request(&first_logical, Some("retry-2")),
+                &auth("project-a"),
+                1,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            resolver_request_idempotency_key("mcp.fetch_source", &first, true),
+            format!("resolver_mcp_fetch_source:{first}")
         );
     }
 
     #[test]
-    fn idempotency_key_generates_prefixed_fallback() {
-        let auth = ResolverAuthContext {
-            access_token: Some("token".to_string()),
-            client_id: Some("client".to_string()),
-            scopes: vec!["tool:fetch_source".to_string()],
-            audiences: Vec::new(),
-            tenant_id: Some("tenant-a".to_string()),
-            project_id: Some("project-a".to_string()),
+    fn caller_key_registry_replays_exact_requests_and_rejects_conflicts() {
+        let registry = IdempotencyBindingRegistry {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            ttl: Duration::from_secs(60),
+            max_entries: 4,
         };
-        let key = resolver_request_idempotency_key(
-            &ResolverCreditRequest {
-                reason: "resolver.fetch_source",
-                route: "mcp.fetch_source",
-                source_url: Some("https://example.com"),
-                subject_id: None,
-                requested_idempotency_key: None,
-                metadata: json!({}),
-            },
-            &auth,
-        );
+        assert!(!registry.bind("scope", "fingerprint-a").unwrap());
+        registry.mark_captured("scope", "fingerprint-a").unwrap();
+        assert!(registry.bind("scope", "fingerprint-a").unwrap());
+        assert!(matches!(
+            registry.bind("scope", "fingerprint-b"),
+            Err(ResolverCreditsError::IdempotencyConflict)
+        ));
+    }
 
+    #[test]
+    fn capture_ledger_must_bind_project_amount_key_and_fingerprint() {
+        let authorization = ResolverCreditAuthorization {
+            access_token: "token".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            project_id: "project-a".to_string(),
+            amount: 2,
+            reason: "resolver.product_request".to_string(),
+            idempotency_key: "resolver_fetch:fingerprint".to_string(),
+            caller_scope: None,
+            request_fingerprint: "fingerprint".to_string(),
+            capture_attempt_id: "attempt".to_string(),
+            metadata: Map::new(),
+        };
+        let ledger = |project_id: &str, amount_delta: i64, key: &str, fingerprint: &str| {
+            ResolverCreditLedgerEntry {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some(project_id.to_string()),
+                entry_type: "debit".to_string(),
+                amount_delta,
+                idempotency_key: Some(key.to_string()),
+                metadata: json!({
+                    "request_fingerprint": fingerprint,
+                    "pricing_version": PRICING_VERSION,
+                }),
+            }
+        };
+
+        assert!(
+            validate_capture_binding(
+                &ledger("project-a", -2, "resolver_fetch:fingerprint", "fingerprint"),
+                &authorization,
+            )
+            .is_ok()
+        );
+        for mismatched in [
+            ledger("project-b", -2, "resolver_fetch:fingerprint", "fingerprint"),
+            ledger("project-a", -1, "resolver_fetch:fingerprint", "fingerprint"),
+            ledger("project-a", -2, "resolver_fetch:other", "fingerprint"),
+            ledger("project-a", -2, "resolver_fetch:fingerprint", "other"),
+        ] {
+            assert!(validate_capture_binding(&mismatched, &authorization).is_err());
+        }
+    }
+
+    #[test]
+    fn idempotency_key_generates_prefixed_fallback() {
+        let key = resolver_request_idempotency_key("mcp.fetch_source", "fingerprint", false);
         assert!(key.starts_with("resolver_mcp_fetch_source:"));
         assert!(key.len() > "resolver_mcp_fetch_source:".len());
     }

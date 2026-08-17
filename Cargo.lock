@@ -983,6 +983,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "url",
+ "uuid",
 ]
 
 [[package]]
