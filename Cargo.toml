@@ -27,4 +27,5 @@ tokio-util = "0.7.18"
 url = "2.5.8"
 
 [dev-dependencies]
+futures-util = "0.3.32"
 tower = { version = "0.5.3", features = ["util"] }

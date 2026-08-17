@@ -98,12 +98,12 @@ async fn main() -> Result<()> {
         ))
         .layer(middleware::from_fn(mcp::mirror_tools_list_security_schemes))
         .layer(middleware::from_fn_with_state(
-            security_config.clone(),
-            security::mcp_timeout,
-        ))
-        .layer(middleware::from_fn_with_state(
             mcp_runtime,
             security::exact_mcp_origin,
+        ))
+        .layer(middleware::from_fn_with_state(
+            security_config.clone(),
+            security::mcp_timeout,
         ));
 
     let runtime_state = Arc::new(lifecycle::RuntimeState::new());
@@ -228,12 +228,22 @@ mod tests {
         tool, tool_handler, tool_router,
     };
     use std::{
+        convert::Infallible,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-        time::Duration,
+        task::Poll,
+        time::{Duration, Instant},
     };
     use tower::ServiceExt;
 
     type Result<T, E> = std::result::Result<T, E>;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     #[derive(Clone, Default)]
     struct TestServer;
@@ -487,6 +497,59 @@ mod tests {
         assert_eq!(evidence.load(Ordering::Acquire), 0);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(evidence.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_deadline_bounds_stalled_body_and_drops_downstream() {
+        let runtime = config::McpRuntimeConfig {
+            allowed_hosts: vec!["resolver.example".into()],
+            allowed_origins: vec!["https://app.example".into()],
+        };
+        let service = StreamableHttpService::new(
+            || Ok::<_, std::io::Error>(TestServer),
+            NeverSessionManager::default().into(),
+            mcp_config(&runtime),
+        );
+        let security = config::SecurityConfig {
+            product_body_bytes: config::DEFAULT_PRODUCT_BODY_BYTES,
+            product_timeout: Duration::from_secs(1),
+            mcp_timeout: Duration::from_millis(20),
+            shutdown_grace: Duration::from_secs(1),
+            hsts_enabled: false,
+        };
+        let app =
+            Router::new()
+                .route_service("/mcp", service)
+                .layer(middleware::from_fn_with_state(
+                    security,
+                    security::mcp_timeout,
+                ));
+
+        let body_dropped = Arc::new(AtomicBool::new(false));
+        let drop_flag = DropFlag(body_dropped.clone());
+        let stalled_body = futures_util::stream::poll_fn(
+            move |_| -> Poll<Option<std::result::Result<String, Infallible>>> {
+                let _keep_drop_flag_alive = &drop_flag;
+                Poll::Pending
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "resolver.example")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(
+                axum::http::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .body(Body::from_stream(stalled_body))
+            .expect("stalled MCP request");
+
+        let started = Instant::now();
+        let response = app.oneshot(request).await.expect("timeout response");
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(body_dropped.load(Ordering::Acquire));
     }
 
     fn mcp_request(body: &'static str) -> Request<Body> {

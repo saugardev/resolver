@@ -993,6 +993,7 @@ dependencies = [
  "antissrf",
  "axum",
  "dotenvy",
+ "futures-util",
  "hex",
  "livy-provenance-sdk",
  "livy-tee",

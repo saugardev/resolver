@@ -179,9 +179,11 @@ LIVY_RESOLVER_HSTS_ENABLED=false
 LIVY_RESOLVER_DNS_TIMEOUT_SECS=3
 LIVY_RESOLVER_ALLOW_PRIVATE_SOURCES=false
 # Required in production before any Spider-backed source operation is accepted:
+SPIDER_API_URL=https://api.spider.cloud
 LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION=spider-egress-policy-v1
-LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL=https://spider-policy.example/readyz
+LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL=https://api.spider.cloud/egress-capability
 LIVY_RESOLVER_SPIDER_EGRESS_READINESS_TIMEOUT_SECS=3
+LIVY_RESOLVER_ALLOW_INSECURE_SPIDER_DEV=false
 ```
 
 Enable HSTS only when the public endpoint is served through HTTPS. The API
@@ -200,9 +202,27 @@ bounded `LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL`. This is an operator
 attestation—not automatic discovery—that the selected Spider deployment or
 policy proxy rejects non-public initial destinations, DNS changes, and every
 redirect target. The resolver explicitly requests Spider's strict redirect
-policy, disables redirects on the readiness probe, and requires a successful
-probe before every debit/fetch. Keep the policy at the infrastructure egress
-point where the actual connection is made.
+policy and requires an authenticated capability endpoint on the exact normalized
+`SPIDER_API_URL` origin. A separate readiness origin is not supported; deploy a
+policy proxy by making it `SPIDER_API_URL` so it is also the actual fetch path.
+The probe uses the Spider bearer credential, requires HTTPS, disables redirects,
+caps the response at 4 KiB, and accepts only `application/json` with exactly:
+
+```json
+{
+  "schema": "livy.resolver.spider-egress-capability/v1",
+  "spider_api_url": "https://api.spider.cloud",
+  "dns_all_answers_enforced": true,
+  "redirect_every_hop_enforced": true
+}
+```
+
+Unknown fields, a different upstream identity, false controls, plain 2xx
+responses, and redirected probes fail closed. Loopback HTTP is available only
+with the explicit `LIVY_RESOLVER_ALLOW_INSECURE_SPIDER_DEV=true` development
+override. The resolver requires a successful probe before every debit/fetch.
+Keep the policy at the infrastructure egress point where the actual connection
+is made.
 
 For a trusted internal deployment, the narrow
 `LIVY_RESOLVER_TRUSTED_SOURCE_HOSTS` allow-list bypasses only the local

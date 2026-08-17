@@ -13,7 +13,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +22,7 @@ tokio::task_local! {
 }
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MCP_CANCELLATION_GRACE: Duration = Duration::from_millis(100);
 
 /// Cooperative cancellation inserted before RMCP detaches stateless request handling.
 #[derive(Clone, Debug)]
@@ -97,29 +98,26 @@ pub async fn mcp_timeout(
     request
         .extensions_mut()
         .insert(McpRequestCancellation(cancellation.clone()));
-    let request = next.run(request);
-    tokio::pin!(request);
-    let deadline = tokio::time::sleep(config.mcp_timeout);
-    tokio::pin!(deadline);
-
+    let mut downstream = Box::pin(next.run(request));
     tokio::select! {
-        response = &mut request => response,
-        () = &mut deadline => {
-            // The production MCP tool observes this token around its entire operation. Wait for
-            // its terminal response so debit/fetch/receipt/provenance work cannot outlive 504.
-            cancellation.cancel();
-            let _terminal_response = request.await;
-            (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(json!({
-                "error": "MCP request timed out",
-                "code": "mcp_request_timeout",
-                "request_id": current_request_id(),
-            })),
-        )
-                .into_response()
-        },
+        response = &mut downstream => return response,
+        () = tokio::time::sleep(config.mcp_timeout) => {}
     }
+
+    cancellation.cancel();
+    // Cooperative tool cancellation normally completes immediately. A stalled request body or
+    // non-cooperative downstream gets only this bounded drain window before its future is dropped.
+    let _ = tokio::time::timeout(MCP_CANCELLATION_GRACE, &mut downstream).await;
+    drop(downstream);
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(json!({
+            "error": "MCP request timed out",
+            "code": "mcp_request_timeout",
+            "request_id": current_request_id(),
+        })),
+    )
+        .into_response()
 }
 
 /// RMCP accepts a configured origin with no port as a wildcard. Enforce the exact effective
