@@ -144,7 +144,21 @@ Response shape:
 }
 ```
 
-Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|crawl|map|search|extract|screenshot`), `format`, `proxy`, `receipt`.
+Request fields include `source`, `query`/`q`, `mode`, `format`, `proxy`, and
+`receipt`. The mode contract is route-specific:
+
+- `/fetch` accepts `auto`, `fast`, `browser`, `unblock`, or `raw`.
+- `/crawl`, `/map`, `/search`, `/extract`, and `/screenshot` accept `auto` or
+  their route-named mode. Other combinations return `400` instead of running a
+  different operation under the requested label.
+- `proxy` accepts `auto`, `none`, `isp`, `residential`, or `mobile`.
+  `proxy_enabled` is deprecated and rejected. `auto` uses ISP for
+  auto/fast/extract/unblock and no proxy for the other modes.
+
+Auto and fast requests perform at most one unblock fallback during the current
+request when the first response is a recognized browser, JavaScript, robots, or
+human-verification challenge. Both attempts share one deadline and only the
+final successful result can create a receipt or provenance record.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -168,8 +182,14 @@ these deployment safety limits with:
 ```dotenv
 LIVY_RESOLVER_MAX_PRODUCT_BODY_BYTES=65536
 LIVY_RESOLVER_PRODUCT_TIMEOUT_SECS=65
+LIVY_RESOLVER_MAX_UPSTREAM_BYTES=8388608
 LIVY_RESOLVER_HSTS_ENABLED=false
 ```
+
+Spider calls have a five-second connect timeout, a 65-second client ceiling,
+the request's `timeout_secs` absolute deadline (1–60 seconds), and the response
+limit above. Every non-2xx Spider response maps to an upstream error before
+receipt or provenance creation.
 
 Enable HSTS only when the public endpoint is served through HTTPS. The API
 accepts absolute HTTP and HTTPS source URLs, including localhost and private

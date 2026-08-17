@@ -20,6 +20,10 @@ pub enum FetchError {
     Http(String),
     #[error("Upstream fetch failed")]
     Upstream(String),
+    #[error("Upstream fetch returned HTTP {status}")]
+    UpstreamStatus { status: StatusCode, body: String },
+    #[error("Upstream response exceeded {limit} bytes")]
+    UpstreamResponseTooLarge { limit: usize },
     #[error("Fetch timed out")]
     Timeout(String),
     #[error("Not found")]
@@ -112,10 +116,17 @@ pub enum SnapshotError {
 impl IntoResponse for FetchError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
-            FetchError::UnableFetch(_) | FetchError::Upstream(_) => (
+            FetchError::UnableFetch(_)
+            | FetchError::Upstream(_)
+            | FetchError::UpstreamStatus { .. } => (
                 StatusCode::BAD_GATEWAY,
                 "upstream_fetch_failed",
                 "Upstream fetch failed".to_string(),
+            ),
+            FetchError::UpstreamResponseTooLarge { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_response_too_large",
+                "Upstream response exceeded the configured limit".to_string(),
             ),
             FetchError::UnableToSerialize(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -189,7 +200,11 @@ fn compact_body(body: &str) -> String {
     if body.len() <= 512 {
         return body.to_string();
     }
-    format!("{}...", &body[..512])
+    let end = (0..=512)
+        .rev()
+        .find(|index| body.is_char_boundary(*index))
+        .unwrap_or(0);
+    format!("{}...", &body[..end])
 }
 
 #[cfg(test)]
@@ -208,6 +223,28 @@ mod tests {
         assert_eq!(value["code"], "upstream_fetch_failed");
         assert_eq!(value["error"], "Upstream fetch failed");
         assert!(!String::from_utf8_lossy(&body).contains("secret backend detail"));
+
+        let response = FetchError::UpstreamStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "secret status body".into(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status error body");
+        assert!(!String::from_utf8_lossy(&body).contains("secret status body"));
+    }
+
+    #[tokio::test]
+    async fn oversized_upstream_response_has_a_stable_public_code() {
+        let response = FetchError::UpstreamResponseTooLarge { limit: 64 }.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("limit error body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json error");
+        assert_eq!(value["code"], "upstream_response_too_large");
     }
 
     #[tokio::test]
@@ -231,5 +268,15 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json error");
         assert_eq!(value["code"], "invalid_request");
         assert_eq!(value["error"], "`limit` must be between 1 and 100");
+    }
+
+    #[test]
+    fn compact_body_truncates_multibyte_text_at_a_character_boundary() {
+        let body = format!("{}é-secret", "a".repeat(511));
+        let compacted = compact_body(&body);
+
+        assert_eq!(compacted, format!("{}...", "a".repeat(511)));
+        assert!(compacted.is_char_boundary(compacted.len()));
+        assert!(!compacted.contains("secret"));
     }
 }

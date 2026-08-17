@@ -179,6 +179,12 @@ curl -s http://localhost:3001/fetch \
   -d '{"source":"https://example.com","mode":"fast","receipt":true}'
 ```
 
+`/fetch` accepts `auto|fast|browser|unblock|raw`. Dedicated operation routes
+accept `auto` or their matching mode. Use `proxy` with
+`auto|none|isp|residential|mobile`; the deprecated `proxy_enabled` boolean is
+rejected. Auto/fast may make one in-deadline unblock attempt when the initial
+response is a recognized anti-bot challenge.
+
 ## Code Map
 
 - `src/main.rs`: mounts HTTP routes and `/mcp`

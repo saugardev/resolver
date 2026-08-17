@@ -272,7 +272,7 @@ impl Server {
         } else {
             match self
                 .fetcher
-                .get_fast_data_with_receipt_with_auth(&url, Some(&auth_context))
+                .get_adaptive_data_with_receipt_with_auth(&url, Some(&auth_context))
                 .await
             {
                 Ok(data) => {
@@ -284,11 +284,7 @@ impl Server {
                     data
                 }
                 Err(e) => {
-                    analyze_fetch_error_in_background(
-                        self.fallback_cache.clone(),
-                        cache_key,
-                        e.to_string(),
-                    );
+                    analyze_fetch_error_in_background(self.fallback_cache.clone(), cache_key, &e);
                     eprintln!(
                         "{}",
                         json!({
@@ -305,12 +301,17 @@ impl Server {
         };
 
         let text = render_fetch_result(&data);
+        let executed_mode = data
+            .receipt
+            .mode
+            .strip_prefix("fetch:")
+            .unwrap_or(data.receipt.mode.as_str());
         eprintln!(
             "{}",
             json!({
                 "event": "mcp_fetch_source_ok",
                 "request_id": crate::security::current_request_id(),
-                "mode": if fallback_reason.is_some() { "unblock" } else { "fast" },
+                "mode": executed_mode,
                 "source_sha256": &source_sha256,
                 "elapsed_ms": started.elapsed().as_millis(),
                 "response_bytes": text.len(),
@@ -824,9 +825,14 @@ fn analyze_fetch_data_in_background(cache: Arc<FetchFallbackCache>, key: String,
     });
 }
 
-fn analyze_fetch_error_in_background(cache: Arc<FetchFallbackCache>, key: String, error: String) {
+fn analyze_fetch_error_in_background(
+    cache: Arc<FetchFallbackCache>,
+    key: String,
+    error: &crate::errors::FetchError,
+) {
+    let reason = crate::fetch::fallback_reason_for_fetch_error(error);
     tokio::spawn(async move {
-        if let Some(reason) = fallback_reason_for_text(&error) {
+        if let Some(reason) = reason {
             eprintln!(
                 "{}",
                 json!({
@@ -841,95 +847,12 @@ fn analyze_fetch_error_in_background(cache: Arc<FetchFallbackCache>, key: String
 }
 
 fn fallback_reason_for_fetch_data(data: &Value) -> Option<&'static str> {
-    if let Some(content) = extracted_content(data) {
-        return fallback_reason_for_text(content);
-    }
-    fallback_reason_for_text(&data.to_string())
+    crate::fetch::fallback_reason_for_fetch_data(data)
 }
 
+#[cfg(test)]
 fn fallback_reason_for_text(text: &str) -> Option<&'static str> {
-    let normalized = normalize_detector_text(text);
-    if contains_any(
-        &normalized,
-        &[
-            "enable javascript",
-            "requires javascript",
-            "require javascript",
-            "javascript is disabled",
-            "javascript disabled",
-            "please enable js",
-            "turn on javascript",
-            "you need javascript",
-            "browser is required",
-        ],
-    ) {
-        return Some("javascript_required");
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "blocked by robots",
-            "disallowed by robots",
-            "robots.txt",
-            "robots policy",
-            "respect robots",
-        ],
-    ) {
-        return Some("robots_blocked");
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "verify you are human",
-            "verify that you are human",
-            "confirm you are human",
-            "prove you are human",
-            "are you a human",
-            "human verification",
-            "not a robot",
-            "are not a robot",
-            "verify you are not a robot",
-            "complete the security check",
-            "security check to access",
-            "captcha",
-        ],
-    ) {
-        return Some("human_verification");
-    }
-
-    if looks_like_browser_check(&normalized) {
-        return Some("browser_check");
-    }
-
-    None
-}
-
-fn looks_like_browser_check(normalized: &str) -> bool {
-    contains_any(
-        normalized,
-        &[
-            "checking your browser",
-            "checking if the site connection is secure",
-            "just a moment...",
-        ],
-    ) || (normalized.contains("cloudflare")
-        && contains_any(
-            normalized,
-            &["ray id", "attention required", "challenge", "turnstile"],
-        ))
-}
-
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
-}
-
-fn normalize_detector_text(text: &str) -> String {
-    text.to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::fetch::fallback_reason_for_text(text)
 }
 
 fn normalize_fallback_url_key(url: &str) -> String {

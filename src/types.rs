@@ -14,11 +14,12 @@ const MAX_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// High-level route behavior exposed to API clients.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductMode {
     /// Let the service choose the default SmartMode path.
     #[serde(alias = "smart", alias = "smart_mode")]
+    #[default]
     Auto,
     /// Use the fast SmartMode + ISP proxy source-fetch path.
     Fast,
@@ -40,13 +41,23 @@ pub enum ProductMode {
     Screenshot,
 }
 
-impl Default for ProductMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
 impl ProductMode {
+    /// Stable request value used in validation errors and documentation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+            Self::Browser => "browser",
+            Self::Unblock => "unblock",
+            Self::Raw => "raw",
+            Self::Crawl => "crawl",
+            Self::Map => "map",
+            Self::Search => "search",
+            Self::Extract => "extract",
+            Self::Screenshot => "screenshot",
+        }
+    }
+
     /// Stable receipt label for the selected mode.
     pub fn receipt_label(self) -> &'static str {
         match self {
@@ -130,6 +141,8 @@ pub struct ProductRequest {
     pub formats: Option<Vec<ProductFormat>>,
     /// Proxy routing preference.
     pub proxy: Option<ProductProxy>,
+    /// Deprecated Spider boolean retained only to return an actionable error.
+    pub proxy_enabled: Option<bool>,
     /// Maximum page or result count.
     pub limit: Option<u32>,
     /// Crawl depth.
@@ -220,6 +233,13 @@ impl ProductRequest {
         } else {
             validate_source_url(self.require_source()?)?;
         }
+        validate_mode_for_route(self.mode, route)?;
+        if self.proxy_enabled.is_some() {
+            return Err(FetchError::BadRequest(
+                "`proxy_enabled` is deprecated; use `proxy` with auto, none, isp, residential, or mobile"
+                    .into(),
+            ));
+        }
 
         validate_range("limit", self.limit.map(u64::from), 1, 100)?;
         validate_range("search_limit", self.search_limit.map(u64::from), 1, 100)?;
@@ -289,6 +309,7 @@ impl ProductRequest {
             format: None,
             formats: None,
             proxy: Some(ProductProxy::None),
+            proxy_enabled: None,
             limit: None,
             depth: None,
             timeout_secs: Some(25),
@@ -346,6 +367,42 @@ impl ProductRequest {
         self.source
             .as_deref()
             .ok_or_else(|| crate::errors::FetchError::BadRequest("route requires `source`".into()))
+    }
+}
+
+fn validate_mode_for_route(
+    mode: ProductMode,
+    route: ProductRoute,
+) -> Result<(), crate::errors::FetchError> {
+    use crate::errors::FetchError;
+
+    let valid = match route {
+        ProductRoute::Scrape => matches!(
+            mode,
+            ProductMode::Auto
+                | ProductMode::Fast
+                | ProductMode::Browser
+                | ProductMode::Unblock
+                | ProductMode::Raw
+        ),
+        ProductRoute::Crawl => matches!(mode, ProductMode::Auto | ProductMode::Crawl),
+        ProductRoute::Map => matches!(mode, ProductMode::Auto | ProductMode::Map),
+        ProductRoute::Search => matches!(mode, ProductMode::Auto | ProductMode::Search),
+        ProductRoute::Extract => matches!(mode, ProductMode::Auto | ProductMode::Extract),
+        ProductRoute::Screenshot => {
+            matches!(mode, ProductMode::Auto | ProductMode::Screenshot)
+        }
+        ProductRoute::Unblock => matches!(mode, ProductMode::Auto | ProductMode::Unblock),
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(FetchError::BadRequest(format!(
+            "mode `{}` is not valid for `{}`",
+            mode.as_str(),
+            route.as_str()
+        )))
     }
 }
 
@@ -655,6 +712,7 @@ pub struct ProductResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::FetchError;
 
     #[test]
     fn source_validation_allows_http_private_destinations() {
@@ -680,6 +738,39 @@ mod tests {
             ..ProductRequest::legacy("https://example.com")
         };
         assert!(search.validate_for(ProductRoute::Search).is_ok());
+    }
+
+    #[test]
+    fn product_validation_rejects_modes_owned_by_other_routes() {
+        let mut fetch = ProductRequest::legacy("https://example.com");
+        fetch.mode = ProductMode::Crawl;
+        assert!(matches!(
+            fetch.validate_for(ProductRoute::Scrape),
+            Err(FetchError::BadRequest(message))
+                if message == "mode `crawl` is not valid for `fetch`"
+        ));
+
+        let mut crawl = ProductRequest::legacy("https://example.com");
+        crawl.mode = ProductMode::Fast;
+        assert!(crawl.validate_for(ProductRoute::Crawl).is_err());
+
+        crawl.mode = ProductMode::Auto;
+        assert!(crawl.validate_for(ProductRoute::Crawl).is_ok());
+    }
+
+    #[test]
+    fn product_validation_rejects_deprecated_proxy_boolean_conflicts() {
+        let request: ProductRequest = serde_json::from_value(serde_json::json!({
+            "source": "https://example.com",
+            "proxy": "isp",
+            "proxy_enabled": false
+        }))
+        .expect("request JSON");
+
+        assert!(matches!(
+            request.validate_for(ProductRoute::Scrape),
+            Err(FetchError::BadRequest(message)) if message.contains("`proxy_enabled` is deprecated")
+        ));
     }
 
     #[test]
