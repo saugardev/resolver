@@ -2,17 +2,17 @@
 
 use crate::auth::ResolverAuthContext;
 use crate::errors::ProvenanceError;
+use crate::provenance_api::{
+    CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
+    ProvenanceAttestationResponse, ProvenanceCommitMode, ProvenanceFieldDisclosure,
+    ProvenanceHttpClient, ProvenanceManagedPublicationArtifact,
+    ProvenanceManagedPublicationRequest, ProvenanceRegistryRefResponse, ProvenanceTemplateField,
+    ProvenanceVerificationMode, UpsertProvenanceTemplateRequest, build_http_client,
+    decode_json_response, validate_base_url,
+};
 use crate::types::{
     FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest, ProductRoute,
     ProvenanceConsent, Receipt,
-};
-use livy_provenance_sdk::{
-    CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
-    ProvenanceAttestationResponse, ProvenanceClient as LivyProvenanceApiClient,
-    ProvenanceClientConfig, ProvenanceCommitMode, ProvenanceFieldDisclosure,
-    ProvenanceManagedPublicationArtifact, ProvenanceManagedPublicationRequest,
-    ProvenanceRegistryRefResponse, ProvenanceTemplateField, ProvenanceVerificationMode,
-    RegistryRefWaitOptions, UpsertProvenanceTemplateRequest,
 };
 use livy_tee::Livy;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -40,7 +40,7 @@ const RESPONSE_ARTIFACT_SCHEMA: &str = "resolver-tool-exchange-v1";
 #[derive(Debug)]
 pub struct ProvenanceClient {
     config: ProvenanceConfig,
-    api: Option<LivyProvenanceApiClient>,
+    api: Option<ProvenanceHttpClient>,
     http: reqwest::Client,
     livy: Livy,
     template_ready: AtomicBool,
@@ -218,6 +218,8 @@ impl ProvenanceClient {
             env_u32("LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS")?.unwrap_or(30);
         let registry_wait_interval_ms =
             env_u64("LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS")?.unwrap_or(2_000);
+        let provenance_timeout =
+            Duration::from_secs(env_u64("LIVY_PROVENANCE_TIMEOUT_SECS")?.unwrap_or(10));
         let legacy_service_api_key_allowed = !production_environment()
             || env_bool("LIVY_PROVENANCE_ALLOW_SERVICE_API_KEY")?.unwrap_or(false);
 
@@ -232,15 +234,18 @@ impl ProvenanceClient {
             publish_response_artifact,
             public_disclosure_allowed,
         )?;
+        validate_base_url(&backend_base_url)?;
 
         let livy = Livy::from_env().map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
+        let http = build_http_client(provenance_timeout)?;
         let api = api_key
             .map(|api_key| {
-                LivyProvenanceApiClient::new(ProvenanceClientConfig::with_base_url(
+                ProvenanceHttpClient::new(
                     backend_base_url.clone(),
                     api_key,
                     integration_id.clone(),
-                ))
+                    http.clone(),
+                )
             })
             .transpose()?;
 
@@ -265,7 +270,7 @@ impl ProvenanceClient {
                 legacy_service_api_key_allowed,
             },
             api,
-            http: reqwest::Client::new(),
+            http,
             livy,
             template_ready: AtomicBool::new(false),
         }))
@@ -425,12 +430,7 @@ impl ProvenanceClient {
         } else {
             let api = self.legacy_api()?;
             self.ensure_template_if_configured().await?;
-            if let Some(publish) = publish {
-                api.create_attestation_with_publication(request, publish)
-                    .await?
-            } else {
-                api.create_attestation(request).await?
-            }
+            api.create_attestation(request, publish).await?
         };
         let mut registry_ref_poll_error = None;
         if disclosure.managed_publication
@@ -441,10 +441,8 @@ impl ProvenanceClient {
             match api
                 .wait_for_registry_refs(
                     &record.provenance_attestation_id,
-                    RegistryRefWaitOptions::new(
-                        self.config.registry_wait_attempts,
-                        Duration::from_millis(self.config.registry_wait_interval_ms),
-                    ),
+                    self.config.registry_wait_attempts,
+                    Duration::from_millis(self.config.registry_wait_interval_ms),
                 )
                 .await
             {
@@ -481,7 +479,7 @@ impl ProvenanceClient {
         })
     }
 
-    fn legacy_api(&self) -> Result<&LivyProvenanceApiClient, ProvenanceError> {
+    fn legacy_api(&self) -> Result<&ProvenanceHttpClient, ProvenanceError> {
         if !self.config.legacy_service_api_key_allowed {
             return Err(ProvenanceError::InvalidEnv(
                 "legacy service API-key provenance writes are disabled in production; use OAuth passthrough".to_string(),
@@ -531,13 +529,7 @@ impl ProvenanceClient {
             .send()
             .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProvenanceError::Backend { status, body });
-        }
-
-        Ok(response.json().await?)
+        decode_json_response(response).await
     }
 
     fn request_body_with_integration<T>(&self, request: &T) -> Result<Value, ProvenanceError>
@@ -1284,9 +1276,15 @@ fn env_bool(name: &str) -> Result<Option<bool>, ProvenanceError> {
 fn env_u32(name: &str) -> Result<Option<u32>, ProvenanceError> {
     optional_env(name)
         .map(|value| {
-            value.parse::<u32>().map_err(|_| {
-                ProvenanceError::InvalidEnv(format!("{name} must be an unsigned integer"))
-            })
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    ProvenanceError::InvalidEnv(format!(
+                        "{name} must be a positive unsigned integer"
+                    ))
+                })
         })
         .transpose()
 }
@@ -1294,9 +1292,15 @@ fn env_u32(name: &str) -> Result<Option<u32>, ProvenanceError> {
 fn env_u64(name: &str) -> Result<Option<u64>, ProvenanceError> {
     optional_env(name)
         .map(|value| {
-            value.parse::<u64>().map_err(|_| {
-                ProvenanceError::InvalidEnv(format!("{name} must be an unsigned integer"))
-            })
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    ProvenanceError::InvalidEnv(format!(
+                        "{name} must be a positive unsigned integer"
+                    ))
+                })
         })
         .transpose()
 }
@@ -1456,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn verification_mode_env_values_map_to_sdk_enum() {
+    fn verification_mode_env_values_map_to_public_contract() {
         assert_eq!(
             parse_verification_mode("binding_only").unwrap(),
             ProvenanceVerificationMode::BindingOnly

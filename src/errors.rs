@@ -4,7 +4,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
-use livy_provenance_sdk::ProvenanceClientError;
 use serde_json::json;
 use thiserror::Error;
 
@@ -131,12 +130,14 @@ pub enum ProvenanceError {
     MissingEnv(&'static str),
     #[error("invalid provenance configuration: {0}")]
     InvalidEnv(String),
-    #[error("provenance SDK failed: {0}")]
-    Sdk(#[from] ProvenanceClientError),
     #[error("provenance HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("provenance backend returned {status}: {body}")]
-    Backend { status: StatusCode, body: String },
+    #[error("provenance backend returned {status}")]
+    Backend { status: StatusCode },
+    #[error("provenance response exceeded {limit} bytes")]
+    ResponseTooLarge { limit: usize },
+    #[error("provenance registry wait failed: {0}")]
+    RegistryWait(String),
     #[error("provenance JSON handling failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("provenance attestation failed: {0}")]

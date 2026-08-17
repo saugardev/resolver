@@ -174,8 +174,6 @@ fn new_request_id() -> String {
 fn normalized_path(path: &str) -> &str {
     if path.starts_with("/receipt/") {
         "/receipt/{id}"
-    } else if path.starts_with("/recipt/") {
-        "/recipt/{id}"
     } else {
         path
     }

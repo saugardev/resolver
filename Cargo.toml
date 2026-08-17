@@ -1,29 +1,30 @@
 [package]
-name = "livygensyn"
-authors = ["protocolwhisper"]
+name = "livy-resolver"
+authors = ["Livy Labs"]
 version = "0.1.0"
 edition = "2024"
-
-[features]
-default = ["mcp"]
-mcp = []
+rust-version = "1.94"
+description = "OAuth-protected HTTP and MCP source resolver for Livy"
+repository = "https://github.com/livylabs/resolver"
+homepage = "https://livylabs.xyz"
+publish = false
 
 [dependencies]
 async-trait = "0.1.89"
 antissrf = { version = "0.1.1", default-features = false }
-axum = {version = "0.8.9" , features = ["macros"]}
+axum = { version = "0.8.9", features = ["macros"] }
+base64 = "0.22.1"
 dotenvy = "0.15.7"
 hex = "0.4.3"
-livy-tee = { version = "0.1.1" , features = ["ita-verify"]}
-livy-provenance-sdk = { path = "../livy-core/packages/provenance-sdk" }
+livy-tee = { version = "0.1.1", features = ["ita-verify"] }
 reqwest = "0.12.28"
-rmcp = {version ="3.1.2", features = ["server", "transport-streamable-http-server"]}
-serde = {version = "1.0.228" , features = ["derive"]}
+rmcp = { version = "3.1.2", features = ["server", "transport-streamable-http-server"] }
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 spider-client = "=0.1.87"
 thiserror = "2.0.18"
-tokio = {version = "1.52.1" , features= ["macros", "net", "rt-multi-thread", "signal", "sync", "time"]}
+tokio = { version = "1.52.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7.18"
 url = "2.5.8"
 uuid = { version = "1.23.1", features = ["v4"] }
@@ -32,3 +33,6 @@ uuid = { version = "1.23.1", features = ["v4"] }
 futures-util = "0.3.32"
 tokio-stream = "0.1.18"
 tower = { version = "0.5.3", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"

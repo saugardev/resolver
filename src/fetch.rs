@@ -1235,7 +1235,6 @@ impl Fetcher {
             content_bytes,
             total_cost,
             created_at_unix_ms: Self::now_unix_ms(),
-            demo_message: "amazing job".to_string(),
         };
 
         self.receipts

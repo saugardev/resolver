@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use livygensyn::{
+use livy_resolver::{
     Receipt, ReceiptOwner, ReceiptStore, ReceiptStoreError, ReceiptStoreFactory,
     build_app_with_receipt_store_factory, run_with_receipt_store_factory,
 };

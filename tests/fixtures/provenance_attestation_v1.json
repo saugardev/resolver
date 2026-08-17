@@ -1,0 +1,35 @@
+{
+  "provenance_attestation_id": "attestation-v1-fixture",
+  "subject_id": "resolver_fetch:subject",
+  "schema_id": "resolver-fetch-v1",
+  "schema_version": "1",
+  "verification_status": "verified",
+  "schema_binding_status": "full",
+  "public_values_commitment": "sha256:public-values",
+  "report_payload_hash": "sha256:report-payload",
+  "metadata": {
+    "managed_publication": {
+      "arweave": "ar://fixture"
+    }
+  },
+  "registry_refs": [
+    {
+      "registry_kind": "evm",
+      "provider": "livy",
+      "chain_family": "evm",
+      "chain_id": "8453",
+      "network": "base",
+      "registry_name": "LivyProvenance",
+      "registry_address": "0x0000000000000000000000000000000000000001",
+      "transaction_hash": "0xabc",
+      "block_number": 12345,
+      "attestation_key": "fixture-key",
+      "arweave_location": "ar://fixture",
+      "status": "registered",
+      "explorer_links": {
+        "transaction": "https://explorer.example/tx/0xabc"
+      },
+      "registered_at": "2026-08-17T00:00:00Z"
+    }
+  ]
+}

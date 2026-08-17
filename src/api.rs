@@ -66,6 +66,7 @@ fn json_rejection_response(rejection: JsonRejection) -> Response {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchRequest {
     pub source: String,
     #[serde(default)]
@@ -526,6 +527,17 @@ mod tests {
     };
     use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
+
+    #[test]
+    fn compatibility_contract_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_value::<FetchRequest>(json!({
+                "source": "https://example.com",
+                "reciept": true
+            }))
+            .is_err()
+        );
+    }
 
     #[derive(Clone)]
     struct BoundaryState {

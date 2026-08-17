@@ -299,7 +299,6 @@ mod tests {
             content_bytes: Some(10),
             total_cost: None,
             created_at_unix_ms,
-            demo_message: "test".to_string(),
         }
     }
 

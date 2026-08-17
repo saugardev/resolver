@@ -12,6 +12,7 @@ use crate::errors::{FetchError, Result};
 use crate::fetch::Fetcher;
 use crate::lifecycle::{self, RuntimeState};
 use crate::mcp::{self, FetchFallbackCache};
+use crate::metrics::RuntimeMetrics;
 use crate::receipt_store::{ReceiptStore, ReceiptStoreFactory};
 use crate::security;
 use axum::{
@@ -68,6 +69,7 @@ async fn build_runtime(factory: &dyn ReceiptStoreFactory) -> Result<BuiltApp> {
     let metadata_auth = resolver_auth.clone();
     let mcp_metadata_auth = resolver_auth.clone();
     let mcp_challenge_auth = resolver_auth.clone();
+    let metrics = Arc::new(RuntimeMetrics::default());
 
     let mcp_server_config = mcp_config(&mcp_runtime);
     let mcp_cancellation = mcp_server_config.cancellation_token.clone();
@@ -96,7 +98,6 @@ async fn build_runtime(factory: &dyn ReceiptStoreFactory) -> Result<BuiltApp> {
         .route("/fetchfast", post(fetch_fast))
         .route("/fetchunblock", post(fetch_unblock))
         .route("/receipt/{id}", get(get_receipt))
-        .route("/recipt/{id}", get(get_receipt))
         .layer(Extension(resolver_credits.clone()))
         .layer(Extension(egress_policy.clone()))
         .layer(DefaultBodyLimit::max(security_config.product_body_bytes))
@@ -131,6 +132,7 @@ async fn build_runtime(factory: &dyn ReceiptStoreFactory) -> Result<BuiltApp> {
     let router = Router::new()
         .route("/healthz", get(lifecycle::liveness))
         .route("/readyz", get(application_readiness))
+        .route("/metrics", get(crate::metrics::prometheus))
         .route(
             "/.well-known/oauth-protected-resource",
             get(move || {
@@ -150,6 +152,11 @@ async fn build_runtime(factory: &dyn ReceiptStoreFactory) -> Result<BuiltApp> {
         .layer(Extension(readiness))
         .layer(Extension(runtime_state.clone()))
         .layer(Extension(egress_policy))
+        .layer(Extension(metrics.clone()))
+        .layer(middleware::from_fn_with_state(
+            metrics,
+            crate::metrics::record_http_metrics,
+        ))
         .layer(middleware::from_fn_with_state(
             security_config,
             security::request_security,

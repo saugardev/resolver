@@ -2,7 +2,7 @@
 
 use crate::auth::ResolverAuthContext;
 use crate::errors::ResolverCreditsError;
-use livy_provenance_sdk::DEFAULT_LIVY_API_BASE_URL;
+use crate::provenance_api::DEFAULT_LIVY_API_BASE_URL;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};

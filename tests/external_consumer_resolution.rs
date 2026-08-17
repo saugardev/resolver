@@ -5,7 +5,7 @@ use uuid::Uuid;
 fn fresh_external_consumer_resolves_and_compiles_public_factory_api() {
     let resolver_path = serde_json::to_string(env!("CARGO_MANIFEST_DIR")).unwrap();
     let consumer_root = std::env::temp_dir().join(format!(
-        "livygensyn-external-consumer-{}-{}",
+        "livy-resolver-external-consumer-{}-{}",
         std::process::id(),
         Uuid::new_v4()
     ));
@@ -13,19 +13,19 @@ fn fresh_external_consumer_resolves_and_compiles_public_factory_api() {
 
     let manifest = format!(
         r#"[package]
-name = "livygensyn-external-consumer"
+name = "livy-resolver-external-consumer"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
 [dependencies]
 async-trait = "0.1.89"
-livygensyn = {{ path = {resolver_path} }}
+livy-resolver = {{ path = {resolver_path} }}
 tokio = {{ version = "1.52.1", features = ["macros", "rt-multi-thread"] }}
 "#
     );
     let source = r#"use async_trait::async_trait;
-use livygensyn::{
+use livy_resolver::{
     Receipt, ReceiptOwner, ReceiptStore, ReceiptStoreError, ReceiptStoreFactory,
     build_app_with_receipt_store_factory,
 };

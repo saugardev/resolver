@@ -43,6 +43,7 @@ const FALLBACK_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const FALLBACK_CACHE_MAX_ENTRIES: usize = 1024;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Params {
     #[schemars(
         description = "The exact source URL from the user prompt. Do not replace it with a search query or another URL."
@@ -975,7 +976,7 @@ fn normalize_fallback_url_key(url: &str) -> String {
 }
 
 #[tool_handler(
-    name = "livygensyn-source-fetcher",
+    name = "livy-resolver",
     version = "0.1.0",
     instructions = "This server only fetches user-provided source URLs through adaptive resolver routing. If a user prompt includes a URL or phrases like `source:`, `only take this source`, or `source of truth`, call `fetch_source` with that exact URL before answering. Do not search the web, do not use rumors or alternate sources, and do not replace the URL with a query."
 )]
@@ -1345,6 +1346,23 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn mcp_tool_contract_rejects_unknown_and_malformed_fields() {
+        assert!(
+            serde_json::from_value::<Params>(json!({
+                "url": "https://example.com",
+                "publish": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Params>(json!({
+                "url": 42
+            }))
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn http_oauth_challenge_response_sets_www_authenticate_header() {
         let auth = ResolverAuth::for_tests();
@@ -1458,7 +1476,6 @@ mod tests {
                 content_bytes: Some(7),
                 total_cost: None,
                 created_at_unix_ms: 0,
-                demo_message: String::new(),
             },
             data: json!({"content": "example"}),
             provenance: None,

@@ -135,6 +135,7 @@ pub enum ProductProxy {
 
 /// Product API request accepted by route handlers.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductRequest {
     /// Exact URL to fetch, crawl, map, extract, or screenshot.
     #[serde(alias = "url")]
@@ -695,8 +696,6 @@ pub struct Receipt {
     pub total_cost: Option<String>,
     /// Receipt creation time.
     pub created_at_unix_ms: u128,
-    /// Human-readable demo marker.
-    pub demo_message: String,
 }
 
 /// Legacy receipt-backed fetch response.
@@ -834,5 +833,30 @@ mod tests {
             reveal_response: true,
         });
         assert!(reveal_only.validate_for(ProductRoute::Scrape).is_err());
+    }
+
+    #[test]
+    fn product_contract_rejects_unknown_and_malformed_fields() {
+        assert!(
+            serde_json::from_value::<ProductRequest>(serde_json::json!({
+                "source": "https://example.com",
+                "typo_timeout": 10
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProductRequest>(serde_json::json!({
+                "source": "https://example.com",
+                "timeout_secs": "ten"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProductRequest>(serde_json::json!({
+                "source": "https://example.com",
+                "provenance": {"publish": false, "unexpected": true}
+            }))
+            .is_err()
+        );
     }
 }

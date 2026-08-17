@@ -345,9 +345,7 @@ fn product_required_scopes(path: &str) -> &'static [&'static str] {
         "/extract" => &["resolver:source:extract"],
         "/screenshot" => &["resolver:source:screenshot"],
         "/snapshot" => &["resolver:snapshot:create"],
-        path if path.starts_with("/receipt/") || path.starts_with("/recipt/") => {
-            &["resolver:receipt:read"]
-        }
+        path if path.starts_with("/receipt/") => &["resolver:receipt:read"],
         _ => &["resolver:source:fetch"],
     }
 }
