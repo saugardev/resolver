@@ -33,7 +33,10 @@ use rmcp::transport::streamable_http_server::{
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let security_config = config::SecurityConfig::from_env().map_err(FetchError::Http)?;
-    let fetcher = Arc::new(fetch::Fetcher::new()?);
+    let receipt_store_factory = receipt_store::EnvironmentReceiptStoreFactory;
+    let fetcher = Arc::new(fetch::Fetcher::from_receipt_store_factory(
+        &receipt_store_factory,
+    )?);
     let mcp_fetcher = fetcher.clone();
     let resolver_auth = Arc::new(auth::ResolverAuth::from_env());
     let resolver_credits = Arc::new(credits::ResolverCreditsClient::from_env());

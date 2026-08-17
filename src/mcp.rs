@@ -4,8 +4,10 @@ use crate::auth::{ResolverAuth, ResolverAuthContext};
 use crate::credits::ResolverCreditsClient;
 use crate::errors::ResolverAuthError;
 use crate::fetch::Fetcher;
-use crate::types::FetchWithReceipt;
-use crate::types::{validate_idempotency_key, validate_source_url};
+use crate::types::{
+    FetchWithReceipt, ProductMode, ProductRequest, ProductRoute, ProvenanceConsent,
+    validate_idempotency_key, validate_source_url,
+};
 use axum::{
     Json,
     body::{Body, to_bytes},
@@ -31,6 +33,10 @@ use std::{
 
 const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source", "resolver:source:fetch"];
 const FETCH_SOURCE_TITLE: &str = "Fetch Source";
+const FETCH_SOURCE_DESCRIPTION: &str = "Fetch the exact source URL supplied by the user using adaptive resolver routing. This operation debits Livy credits and stores a tenant-scoped receipt. When provenance is enabled it may also create a private attestation; public publication or response reveal additionally requires deployment capability and explicit authenticated request consent. Do not perform web search or substitute another article.";
+const FETCH_SOURCE_READ_ONLY: bool = false;
+const FETCH_SOURCE_DESTRUCTIVE: bool = true;
+const FETCH_SOURCE_OPEN_WORLD: bool = true;
 const FETCH_SOURCE_INVOCATION_START: &str = "Fetching source";
 const FETCH_SOURCE_INVOCATION_DONE: &str = "Source fetched";
 const EXPLORER_QUERY_BASE_URL: &str = "https://explorer.livylabs.xyz/?q=";
@@ -48,6 +54,16 @@ pub struct Params {
         description = "Optional stable idempotency key for this fetch_source call. Reuse the same key only when retrying the same MCP call."
     )]
     pub idempotency_key: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Explicitly consent to public provenance publication when the deployment permits it. Defaults to false."
+    )]
+    pub publish_provenance: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "Explicitly consent to revealing the upstream response in a managed public provenance artifact. Requires publish_provenance=true and defaults to false."
+    )]
+    pub reveal_provenance_response: bool,
 }
 
 pub struct Server {
@@ -147,7 +163,7 @@ impl Server {
 impl Server {
     #[tool(
         name = "fetch_source",
-        description = "Fetch the exact source URL supplied by the user using adaptive resolver routing. Use this whenever the prompt contains a source URL, `source: <url>`, `only take this source`, or says the URL is the source of truth. Do not perform web search or substitute another article.",
+        description = "Fetch the exact source URL supplied by the user using adaptive resolver routing. This operation debits Livy credits and stores a tenant-scoped receipt. When provenance is enabled it may also create a private attestation; public publication or response reveal additionally requires deployment capability and explicit authenticated request consent. Do not perform web search or substitute another article.",
         annotations(
             title = "Fetch Source",
             read_only_hint = false,
@@ -162,6 +178,8 @@ impl Server {
         Parameters(Params {
             url,
             idempotency_key,
+            publish_provenance,
+            reveal_provenance_response,
         }): Parameters<Params>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth_context = match self.require_oauth(&parts).await? {
@@ -178,6 +196,35 @@ impl Server {
             ))]));
         }
 
+        let cache_key = normalize_fallback_url_key(&url);
+        let fallback_reason = self.fallback_cache.lookup(&cache_key);
+        let route = if fallback_reason.is_some() {
+            ProductRoute::Unblock
+        } else {
+            ProductRoute::Scrape
+        };
+        let mut request = ProductRequest::fast(&url);
+        if route == ProductRoute::Unblock {
+            request.mode = ProductMode::Unblock;
+            request.receipt = Some(true);
+        }
+        request.provenance = Some(ProvenanceConsent {
+            publish: publish_provenance,
+            reveal_response: reveal_provenance_response,
+        });
+        let logical_request = match request
+            .validate_for(route)
+            .and_then(|_| Fetcher::product_billing_context(&request, route))
+        {
+            Ok(logical_request) => logical_request,
+            Err(err) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Invalid fetch_source request: {}",
+                    public_validation_message(&err)
+                ))]));
+            }
+        };
+
         // Keep every fetch path, including cached unblock fallback, behind auth and credit debit.
         let started = Instant::now();
         let source_sha256 = crate::security::sensitive_hash(&url);
@@ -191,49 +238,17 @@ impl Server {
                 "source_sha256": &source_sha256,
             })
         );
-        match self
+        let authorization = match self
             .credits
-            .debit_fetch_source(&auth_context, &url, idempotency_key.as_deref())
+            .preflight_fetch_source(
+                &auth_context,
+                &url,
+                &logical_request,
+                idempotency_key.as_deref(),
+            )
             .await
         {
-            Ok(Some(outcome)) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "mcp_credit_debit",
-                        "request_id": crate::security::current_request_id(),
-                        "source_sha256": &source_sha256,
-                        "charged": outcome.charged,
-                        "amount": outcome.amount,
-                        "mode": outcome.mode,
-                        "enforced": outcome.enforced,
-                    })
-                );
-                if !outcome.permits_work() {
-                    eprintln!(
-                        "{}",
-                        json!({
-                            "event": "mcp_credit_debit_not_enforced",
-                            "request_id": crate::security::current_request_id(),
-                            "source_sha256": &source_sha256,
-                            "mode": outcome.mode,
-                        })
-                    );
-                    return Ok(CallToolResult::error(vec![Content::text(
-                        "Livy credit authorization was not enforced",
-                    )]));
-                }
-            }
-            Ok(None) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "mcp_credit_debit_skipped",
-                        "request_id": crate::security::current_request_id(),
-                        "source_sha256": &source_sha256,
-                    })
-                );
-            }
+            Ok(authorization) => authorization,
             Err(err) => {
                 eprintln!(
                     "{}",
@@ -245,18 +260,18 @@ impl Server {
                         "payment_required": err.is_payment_required(),
                     })
                 );
-                let message = if err.is_payment_required() {
+                let message = if err.is_idempotency_conflict() {
+                    "Idempotency key was already used for a different logical request".to_string()
+                } else if err.is_payment_required() {
                     "Livy payment required".to_string()
                 } else {
                     "Livy credit authorization service is unavailable".to_string()
                 };
                 return Ok(CallToolResult::error(vec![Content::text(message)]));
             }
-        }
+        };
 
-        let cache_key = normalize_fallback_url_key(&url);
-        let fallback_reason = self.fallback_cache.lookup(&cache_key);
-        let data = if let Some(reason) = fallback_reason {
+        let pending = if let Some(reason) = fallback_reason {
             eprintln!(
                 "{}",
                 json!({
@@ -268,7 +283,11 @@ impl Server {
                 })
             );
             self.fetcher
-                .get_unblock_data_with_receipt_with_auth(&url, Some(&auth_context))
+                .prepare_product_fetch_with_auth(
+                    request,
+                    ProductRoute::Unblock,
+                    Some(&auth_context),
+                )
                 .await
                 .map_err(|_| {
                     eprintln!(
@@ -286,17 +305,10 @@ impl Server {
         } else {
             match self
                 .fetcher
-                .get_fast_data_with_receipt_with_auth(&url, Some(&auth_context))
+                .prepare_product_fetch_with_auth(request, ProductRoute::Scrape, Some(&auth_context))
                 .await
             {
-                Ok(data) => {
-                    analyze_fetch_data_in_background(
-                        self.fallback_cache.clone(),
-                        cache_key,
-                        data.data.clone(),
-                    );
-                    data
-                }
+                Ok(pending) => pending,
                 Err(e) => {
                     analyze_fetch_error_in_background(
                         self.fallback_cache.clone(),
@@ -317,6 +329,70 @@ impl Server {
                 }
             }
         };
+
+        match self.credits.capture_authorized_request(authorization).await {
+            Ok(Some(outcome)) if outcome.permits_work() => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "charged": outcome.charged,
+                        "amount": outcome.amount,
+                        "mode": outcome.mode,
+                        "enforced": outcome.enforced,
+                    })
+                );
+            }
+            Ok(Some(outcome)) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit_not_enforced",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "mode": outcome.mode,
+                    })
+                );
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Livy credit authorization was not enforced",
+                )]));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit_skipped",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                    })
+                );
+            }
+            Err(err) => {
+                let message = if err.is_idempotency_conflict() {
+                    "Idempotency key was already used for a different logical request"
+                } else if err.is_payment_required() {
+                    "Livy payment required"
+                } else {
+                    "Livy credit authorization service is unavailable"
+                };
+                return Ok(CallToolResult::error(vec![Content::text(message)]));
+            }
+        }
+
+        let data = self
+            .fetcher
+            .finalize_product_fetch_with_receipt_with_auth(pending, Some(&auth_context))
+            .await
+            .map_err(|_| ErrorData::internal_error("Receipt finalization failed", None))?;
+        if fallback_reason.is_none() {
+            analyze_fetch_data_in_background(
+                self.fallback_cache.clone(),
+                cache_key,
+                data.data.clone(),
+            );
+        }
 
         let text = render_fetch_result(&data);
         eprintln!(
@@ -531,6 +607,7 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
             continue;
         };
         if tool_object.get("name").and_then(Value::as_str) == Some("fetch_source") {
+            changed |= set_json_field(tool_object, "description", json!(FETCH_SOURCE_DESCRIPTION));
             if !tool_object.contains_key("title") {
                 tool_object.insert("title".to_string(), json!(FETCH_SOURCE_TITLE));
                 changed = true;
@@ -583,23 +660,27 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
             let annotations = tool_object
                 .entry("annotations".to_string())
                 .or_insert_with(|| json!({}));
+            if !annotations.is_object() {
+                *annotations = json!({});
+                changed = true;
+            }
             if let Some(annotation_object) = annotations.as_object_mut() {
-                if !annotation_object.contains_key("title") {
-                    annotation_object.insert("title".to_string(), json!(FETCH_SOURCE_TITLE));
-                    changed = true;
-                }
-                if !annotation_object.contains_key("readOnlyHint") {
-                    annotation_object.insert("readOnlyHint".to_string(), json!(true));
-                    changed = true;
-                }
-                if !annotation_object.contains_key("destructiveHint") {
-                    annotation_object.insert("destructiveHint".to_string(), json!(false));
-                    changed = true;
-                }
-                if !annotation_object.contains_key("openWorldHint") {
-                    annotation_object.insert("openWorldHint".to_string(), json!(true));
-                    changed = true;
-                }
+                changed |= set_json_field(annotation_object, "title", json!(FETCH_SOURCE_TITLE));
+                changed |= set_json_field(
+                    annotation_object,
+                    "readOnlyHint",
+                    json!(FETCH_SOURCE_READ_ONLY),
+                );
+                changed |= set_json_field(
+                    annotation_object,
+                    "destructiveHint",
+                    json!(FETCH_SOURCE_DESTRUCTIVE),
+                );
+                changed |= set_json_field(
+                    annotation_object,
+                    "openWorldHint",
+                    json!(FETCH_SOURCE_OPEN_WORLD),
+                );
             }
         }
 
@@ -619,6 +700,14 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
     }
 
     changed
+}
+
+fn set_json_field(object: &mut serde_json::Map<String, Value>, key: &str, value: Value) -> bool {
+    if object.get(key) == Some(&value) {
+        return false;
+    }
+    object.insert(key.to_string(), value);
+    true
 }
 
 impl Server {
@@ -971,8 +1060,8 @@ impl ServerHandler for Server {}
 #[cfg(test)]
 mod tests {
     use super::{
-        FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Server,
-        mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
+        FETCH_SOURCE_DESCRIPTION, FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache,
+        Server, mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
         structured_fetch_result,
     };
     use crate::auth::ResolverAuth;
@@ -1028,6 +1117,17 @@ mod tests {
                 .and_then(|annotations| annotations.destructive_hint),
             Some(true)
         );
+        assert_eq!(tool.description.as_deref(), Some(FETCH_SOURCE_DESCRIPTION));
+        assert!(FETCH_SOURCE_DESCRIPTION.contains("debits Livy credits"));
+        assert!(FETCH_SOURCE_DESCRIPTION.contains("tenant-scoped receipt"));
+        assert!(FETCH_SOURCE_DESCRIPTION.contains("explicit authenticated request consent"));
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("input properties");
+        assert!(properties.contains_key("publish_provenance"));
+        assert!(properties.contains_key("reveal_provenance_response"));
         assert_eq!(
             tool.annotations
                 .as_ref()
@@ -1113,6 +1213,11 @@ mod tests {
             "result": {
                 "tools": [{
                     "name": "fetch_source",
+                    "description": "stale description",
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false
+                    },
                     "_meta": {
                         "securitySchemes": [{
                             "type": "oauth2",
@@ -1130,8 +1235,16 @@ mod tests {
             json!(["receipt_id", "explorer", "source_url", "text"])
         );
         assert_eq!(
-            message["result"]["tools"][0]["annotations"]["destructiveHint"],
+            message["result"]["tools"][0]["annotations"]["readOnlyHint"],
             false
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["annotations"]["destructiveHint"],
+            true
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["description"],
+            FETCH_SOURCE_DESCRIPTION
         );
         assert_eq!(
             message["result"]["tools"][0]["securitySchemes"],

@@ -1,11 +1,14 @@
 //! Tenant-scoped receipt persistence boundary.
 //!
 //! The built-in store is deliberately bounded and expiring. It is suitable for
-//! local development and single-replica deployments only; production startup
-//! rejects it unless the operator explicitly acknowledges that limitation. A
+//! local development and explicitly accepted single-replica deployments only;
+//! every startup rejects it unless the operator explicitly acknowledges that
+//! limitation. A
 //! shared durable implementation can be injected through [`ReceiptStore`].
 
 use crate::{auth::ResolverAuthContext, types::Receipt};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Mutex,
@@ -16,7 +19,7 @@ use thiserror::Error;
 pub const DEFAULT_RECEIPT_TTL_SECS: u64 = 15 * 60;
 pub const DEFAULT_RECEIPT_CAPACITY: usize = 10_000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct ReceiptOwner {
     tenant_id: String,
     project_id: String,
@@ -42,6 +45,25 @@ impl ReceiptOwner {
             (None, None) if context.access_token.is_none() => Ok(Self::local()),
             _ => Err(ReceiptStoreError::MissingOwner),
         }
+    }
+
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// Collision-free, versioned key suitable for an external receipt store.
+    pub fn storage_key(&self) -> String {
+        format!(
+            "v1:{}:{}:{}:{}",
+            self.tenant_id().len(),
+            self.tenant_id(),
+            self.project_id().len(),
+            self.project_id()
+        )
     }
 
     #[cfg(test)]
@@ -70,10 +92,11 @@ pub enum ReceiptStoreError {
     InvalidConfiguration(String),
 }
 
+#[async_trait]
 pub trait ReceiptStore: Send + Sync {
-    fn put(&self, owner: &ReceiptOwner, receipt: Receipt) -> Result<(), ReceiptStoreError>;
+    async fn put(&self, owner: &ReceiptOwner, receipt: Receipt) -> Result<(), ReceiptStoreError>;
 
-    fn get(
+    async fn get(
         &self,
         owner: &ReceiptOwner,
         receipt_id: &str,
@@ -83,9 +106,29 @@ pub trait ReceiptStore: Send + Sync {
     fn is_shared_durable(&self) -> bool;
 }
 
+pub trait ReceiptStoreFactory: Send + Sync {
+    fn create(&self) -> Result<std::sync::Arc<dyn ReceiptStore>, ReceiptStoreError>;
+}
+
+#[derive(Debug, Default)]
+pub struct EnvironmentReceiptStoreFactory;
+
+impl ReceiptStoreFactory for EnvironmentReceiptStoreFactory {
+    fn create(&self) -> Result<std::sync::Arc<dyn ReceiptStore>, ReceiptStoreError> {
+        let backend =
+            optional_env("LIVY_RESOLVER_RECEIPT_STORE").unwrap_or_else(|| "memory".to_string());
+        match backend.as_str() {
+            "memory" => Ok(std::sync::Arc::new(InMemoryReceiptStore::from_env()?)),
+            _ => Err(ReceiptStoreError::InvalidConfiguration(format!(
+                "unsupported LIVY_RESOLVER_RECEIPT_STORE `{backend}`; provide a ReceiptStoreFactory backed by shared durable storage"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StoredReceipt {
-    owner: ReceiptOwner,
+    owner_storage_key: String,
     receipt: Receipt,
     inserted_at: Instant,
 }
@@ -119,22 +162,6 @@ impl InMemoryReceiptStore {
     pub fn from_env() -> Result<Self, ReceiptStoreError> {
         let ttl_secs = env_u64("LIVY_RESOLVER_RECEIPT_TTL_SECS", DEFAULT_RECEIPT_TTL_SECS)?;
         let capacity = env_usize("LIVY_RESOLVER_RECEIPT_CAPACITY", DEFAULT_RECEIPT_CAPACITY)?;
-        let backend =
-            optional_env("LIVY_RESOLVER_RECEIPT_STORE").unwrap_or_else(|| "memory".to_string());
-        if backend != "memory" {
-            return Err(ReceiptStoreError::InvalidConfiguration(format!(
-                "unsupported LIVY_RESOLVER_RECEIPT_STORE `{backend}`; inject a shared durable ReceiptStore implementation"
-            )));
-        }
-        if !in_memory_store_allowed(
-            production_environment(),
-            env_bool("LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS", false)?,
-        ) {
-            return Err(ReceiptStoreError::InvalidConfiguration(
-                "the in-memory receipt store is not shared or durable; configure an injected production ReceiptStore or explicitly set LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true for a single-replica exception"
-                    .to_string(),
-            ));
-        }
         Self::new(Duration::from_secs(ttl_secs), capacity)
     }
 
@@ -153,8 +180,9 @@ impl InMemoryReceiptStore {
     }
 }
 
+#[async_trait]
 impl ReceiptStore for InMemoryReceiptStore {
-    fn put(&self, owner: &ReceiptOwner, receipt: Receipt) -> Result<(), ReceiptStoreError> {
+    async fn put(&self, owner: &ReceiptOwner, receipt: Receipt) -> Result<(), ReceiptStoreError> {
         let now = Instant::now();
         let mut records = self
             .records
@@ -164,7 +192,7 @@ impl ReceiptStore for InMemoryReceiptStore {
         records.insert(
             receipt.id.clone(),
             StoredReceipt {
-                owner: owner.clone(),
+                owner_storage_key: owner.storage_key(),
                 receipt,
                 inserted_at: now,
             },
@@ -172,7 +200,7 @@ impl ReceiptStore for InMemoryReceiptStore {
         Ok(())
     }
 
-    fn get(
+    async fn get(
         &self,
         owner: &ReceiptOwner,
         receipt_id: &str,
@@ -185,7 +213,7 @@ impl ReceiptStore for InMemoryReceiptStore {
         records.retain(|_, stored| now.duration_since(stored.inserted_at) < self.ttl);
         Ok(records
             .get(receipt_id)
-            .filter(|stored| &stored.owner == owner)
+            .filter(|stored| stored.owner_storage_key == owner.storage_key())
             .map(|stored| stored.receipt.clone()))
     }
 
@@ -231,7 +259,7 @@ fn env_usize(name: &str, default: usize) -> Result<usize, ReceiptStoreError> {
     }
 }
 
-fn env_bool(name: &str, default: bool) -> Result<bool, ReceiptStoreError> {
+pub fn env_bool(name: &str, default: bool) -> Result<bool, ReceiptStoreError> {
     match optional_env(name).as_deref() {
         Some("1" | "true" | "yes" | "on") => Ok(true),
         Some("0" | "false" | "no" | "off") => Ok(false),
@@ -240,25 +268,6 @@ fn env_bool(name: &str, default: bool) -> Result<bool, ReceiptStoreError> {
         ))),
         None => Ok(default),
     }
-}
-
-fn production_environment() -> bool {
-    [
-        "LIVY_RESOLVER_ENV",
-        "LIVY_ENV",
-        "RWA_ENV",
-        "APP_ENV",
-        "ENVIRONMENT",
-        "NODE_ENV",
-    ]
-    .into_iter()
-    .filter_map(|name| std::env::var(name).ok())
-    .map(|value| value.trim().to_ascii_lowercase())
-    .any(|value| value == "production")
-}
-
-fn in_memory_store_allowed(production: bool, explicit_exception: bool) -> bool {
-    !production || explicit_exception
 }
 
 #[cfg(test)]
@@ -282,49 +291,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn receipt_access_is_tenant_and_project_scoped() {
+    #[tokio::test]
+    async fn receipt_access_is_tenant_and_project_scoped() {
         let store = InMemoryReceiptStore::new(Duration::from_secs(60), 10).unwrap();
         let owner = ReceiptOwner::new("tenant-a", "project-a");
-        store.put(&owner, receipt("opaque-id", 1)).unwrap();
+        store.put(&owner, receipt("opaque-id", 1)).await.unwrap();
 
-        assert!(store.get(&owner, "opaque-id").unwrap().is_some());
+        assert!(store.get(&owner, "opaque-id").await.unwrap().is_some());
         assert!(
             store
                 .get(&ReceiptOwner::new("tenant-b", "project-a"), "opaque-id")
+                .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             store
                 .get(&ReceiptOwner::new("tenant-a", "project-b"), "opaque-id")
+                .await
                 .unwrap()
                 .is_none()
         );
     }
 
-    #[test]
-    fn receipt_store_expires_and_caps_records() {
+    #[tokio::test]
+    async fn receipt_store_expires_and_caps_records() {
         let owner = ReceiptOwner::new("tenant-a", "project-a");
         let capped = InMemoryReceiptStore::new(Duration::from_secs(60), 2).unwrap();
-        capped.put(&owner, receipt("one", 1)).unwrap();
-        capped.put(&owner, receipt("two", 2)).unwrap();
-        capped.put(&owner, receipt("three", 3)).unwrap();
-        assert!(capped.get(&owner, "one").unwrap().is_none());
-        assert!(capped.get(&owner, "two").unwrap().is_some());
-        assert!(capped.get(&owner, "three").unwrap().is_some());
+        capped.put(&owner, receipt("one", 1)).await.unwrap();
+        capped.put(&owner, receipt("two", 2)).await.unwrap();
+        capped.put(&owner, receipt("three", 3)).await.unwrap();
+        assert!(capped.get(&owner, "one").await.unwrap().is_none());
+        assert!(capped.get(&owner, "two").await.unwrap().is_some());
+        assert!(capped.get(&owner, "three").await.unwrap().is_some());
 
         let expiring = InMemoryReceiptStore::new(Duration::from_millis(1), 2).unwrap();
-        expiring.put(&owner, receipt("old", 1)).unwrap();
-        std::thread::sleep(Duration::from_millis(3));
-        assert!(expiring.get(&owner, "old").unwrap().is_none());
+        expiring.put(&owner, receipt("old", 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        assert!(expiring.get(&owner, "old").await.unwrap().is_none());
     }
 
     #[test]
-    fn production_memory_store_requires_explicit_single_replica_exception() {
-        assert!(in_memory_store_allowed(false, false));
-        assert!(!in_memory_store_allowed(true, false));
-        assert!(in_memory_store_allowed(true, true));
+    fn receipt_owner_exposes_an_unambiguous_external_storage_key() {
+        let owner = ReceiptOwner::new("tenant:a", "project:b");
+        assert_eq!(owner.tenant_id(), "tenant:a");
+        assert_eq!(owner.project_id(), "project:b");
+        assert_eq!(owner.storage_key(), "v1:8:tenant:a:9:project:b");
+        assert_eq!(
+            serde_json::to_value(&owner).unwrap(),
+            serde_json::json!({"tenant_id": "tenant:a", "project_id": "project:b"})
+        );
     }
 
     #[test]

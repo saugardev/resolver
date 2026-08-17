@@ -4,7 +4,7 @@ use crate::auth::ResolverAuthContext;
 use crate::errors::ProvenanceError;
 use crate::types::{
     FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest, ProductRoute,
-    Receipt,
+    ProvenanceConsent, Receipt,
 };
 use livy_provenance_sdk::{
     CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
@@ -24,8 +24,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_SCHEMA_ID: &str = "resolver-fetch-v2";
-const DEFAULT_SCHEMA_VERSION: &str = "2";
+const DEFAULT_SCHEMA_ID: &str = "resolver-fetch-v1";
+const DEFAULT_SCHEMA_VERSION: &str = "1";
 const DEFAULT_INTEGRATION_ID: &str = "delphi";
 const DEFAULT_VISIBILITY: &str = "private";
 const DEFAULT_MANAGED_PUBLICATION: bool = false;
@@ -167,11 +167,18 @@ struct ProvenanceSchemaValues<'a> {
     subject_id: &'a str,
     input_commitment: &'a Value,
     output_commitment: &'a Value,
-    source: &'a str,
+    source_commitment: &'a str,
     route: ProductRoute,
     mode: ProductMode,
     fetched_at_unix_ms: u64,
     receipt_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisclosureDecision {
+    public_visibility: bool,
+    managed_publication: bool,
+    reveal_response: bool,
 }
 
 impl ProvenanceClient {
@@ -189,6 +196,7 @@ impl ProvenanceClient {
         let integration_id = env_or("LIVY_INTEGRATION_ID", DEFAULT_INTEGRATION_ID);
         let schema_id = env_or("LIVY_PROVENANCE_SCHEMA_ID", DEFAULT_SCHEMA_ID);
         let schema_version = env_or("LIVY_PROVENANCE_SCHEMA_VERSION", DEFAULT_SCHEMA_VERSION);
+        validate_backend_schema(&schema_id, &schema_version)?;
         let visibility = env_or("LIVY_PROVENANCE_VISIBILITY", DEFAULT_VISIBILITY);
         let verification_mode =
             parse_verification_mode(&env_or("LIVY_PROVENANCE_VERIFICATION_MODE", "verify_fresh"))?;
@@ -268,8 +276,16 @@ impl ProvenanceClient {
         evidence: ResolverFetchEvidence<'_>,
         auth_context: Option<&ResolverAuthContext>,
     ) -> Result<ProvenanceResult, ProvenanceError> {
+        let disclosure = disclosure_decision(
+            &self.config.visibility,
+            self.config.managed_publication,
+            self.config.publish_response_artifact,
+            evidence.payload.provenance.as_ref(),
+            auth_context,
+        )?;
         let fetched_at_unix_ms = unix_millis()?;
         let source = primary_source(evidence.payload);
+        let source_commitment = source_public_commitment(&source);
         let response_bytes = serde_json::to_vec(evidence.data)?;
         let data_sha256 = sha256_bytes_hex(&response_bytes);
         let data_bytes = response_bytes.len();
@@ -281,8 +297,7 @@ impl ProvenanceClient {
             "bytes": data_bytes,
         });
         let receipt_id = evidence.receipt.map(|receipt| receipt.id.clone());
-        let response_artifact_enabled =
-            self.config.managed_publication && self.config.publish_response_artifact;
+        let response_artifact_enabled = disclosure.reveal_response;
         let response_artifact = if artifact_fits_limit(
             response_artifact_enabled,
             response_bytes.len(),
@@ -319,7 +334,7 @@ impl ProvenanceClient {
             .commit(&subject_id)
             .commit_hashed(&input_commitment)
             .commit_hashed(&output_commitment)
-            .commit_hashed(&source)
+            .commit(&source_commitment)
             .commit(&evidence.route.as_str())
             .commit(&mode_label(evidence.mode))
             .commit(&fetched_at_unix_ms);
@@ -339,7 +354,7 @@ impl ProvenanceClient {
             subject_id: &subject_id,
             input_commitment: &input_commitment,
             output_commitment: &output_commitment,
-            source: &source,
+            source_commitment: &source_commitment,
             route: evidence.route,
             mode: evidence.mode,
             fetched_at_unix_ms,
@@ -352,7 +367,11 @@ impl ProvenanceClient {
             subject_id,
             schema_id: Some(self.config.schema_id.clone()),
             schema_version: Some(self.config.schema_version.clone()),
-            visibility: self.config.visibility.clone(),
+            visibility: if disclosure.public_visibility {
+                "public".to_string()
+            } else {
+                "private".to_string()
+            },
             verification_mode: Some(self.config.verification_mode),
             attestation: serde_json::to_value(attestation)?,
             fields,
@@ -371,7 +390,9 @@ impl ProvenanceClient {
                 "output_commitment_sha256": sha256_json_hex(&output_commitment)?,
                 "receipt_id": receipt_id,
                 "response_artifact": {
-                    "enabled": self.config.publish_response_artifact,
+                    "deployment_capability": self.config.publish_response_artifact,
+                    "request_consent": evidence.payload.provenance.as_ref().is_some_and(|consent| consent.reveal_response),
+                    "enabled": disclosure.reveal_response,
                     "included": response_artifact.is_some(),
                     "response_bytes": data_bytes,
                     "artifact_bytes": response_artifact.as_ref().map(Vec::len),
@@ -382,7 +403,7 @@ impl ProvenanceClient {
             )?,
         };
 
-        let publish = if self.config.managed_publication {
+        let publish = if disclosure.managed_publication {
             Some(managed_publication_request(
                 &request.subject_id,
                 evidence.route,
@@ -412,7 +433,7 @@ impl ProvenanceClient {
             }
         };
         let mut registry_ref_poll_error = None;
-        if self.config.managed_publication
+        if disclosure.managed_publication
             && self.config.wait_for_registry_refs
             && !used_oauth_passthrough
         {
@@ -445,7 +466,10 @@ impl ProvenanceClient {
             schema_binding_status: record.schema_binding_status,
             public_values_commitment: record.public_values_commitment,
             report_payload_hash: record.report_payload_hash,
-            explorer_url: self.explorer_url(&record.provenance_attestation_id),
+            explorer_url: self.explorer_url(
+                &record.provenance_attestation_id,
+                disclosure.public_visibility,
+            ),
             managed_publication: record.metadata.get("managed_publication").cloned(),
             registry_refs: record
                 .registry_refs
@@ -601,8 +625,8 @@ impl ProvenanceClient {
             schema_field(
                 4,
                 "source",
-                ProvenanceCommitMode::JsonSha256,
-                json!(values.source),
+                ProvenanceCommitMode::Json,
+                json!(values.source_commitment),
                 true,
             ),
             schema_field(
@@ -676,8 +700,12 @@ impl ProvenanceClient {
         Ok(())
     }
 
-    fn explorer_url(&self, provenance_attestation_id: &str) -> Option<String> {
-        if self.config.visibility != "public" {
+    fn explorer_url(
+        &self,
+        provenance_attestation_id: &str,
+        public_visibility: bool,
+    ) -> Option<String> {
+        if !public_visibility {
             return None;
         }
         let base = self
@@ -783,8 +811,16 @@ pub(crate) fn request_summary(
     let mut summary = serde_json::Map::new();
     insert_value(&mut summary, "route", json!(route.as_str()));
     insert_value(&mut summary, "mode", json!(mode_label(mode)));
-    insert_serialized(&mut summary, "source", &payload.source);
-    insert_serialized(&mut summary, "query", &payload.query);
+    insert_value(
+        &mut summary,
+        "source",
+        json!(payload.source.as_deref().map(source_public_commitment)),
+    );
+    insert_value(
+        &mut summary,
+        "query",
+        json!(payload.query.as_deref().map(source_public_commitment)),
+    );
     insert_value(
         &mut summary,
         "format",
@@ -860,6 +896,7 @@ pub(crate) fn request_summary(
         &payload.max_credits_per_page,
     );
     insert_serialized(&mut summary, "receipt", &payload.receipt);
+    insert_serialized(&mut summary, "provenance", &payload.provenance);
     insert_serialized(&mut summary, "search_limit", &payload.search_limit);
     insert_serialized(
         &mut summary,
@@ -957,11 +994,11 @@ fn resolver_template_fields() -> Vec<ProvenanceTemplateField> {
         template_field(
             4,
             "source",
-            ProvenanceCommitMode::JsonSha256,
-            ProvenanceFieldDisclosure::Commitment,
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             true,
             "string",
-            "Commitment to the fetched URL or search query.",
+            "Stable SHA-256 commitment to the fetched URL or search query.",
         ),
         template_field(
             5,
@@ -1114,6 +1151,82 @@ fn explicit_provenance_enabled(value: Option<bool>) -> bool {
     value == Some(true)
 }
 
+fn disclosure_decision(
+    configured_visibility: &str,
+    managed_publication_capability: bool,
+    response_reveal_capability: bool,
+    consent: Option<&ProvenanceConsent>,
+    auth_context: Option<&ResolverAuthContext>,
+) -> Result<DisclosureDecision, ProvenanceError> {
+    let consent = consent.cloned().unwrap_or_default();
+    if consent.reveal_response && !consent.publish {
+        return Err(ProvenanceError::InvalidEnv(
+            "response reveal consent requires publication consent".to_string(),
+        ));
+    }
+    if !consent.publish {
+        return Ok(DisclosureDecision {
+            public_visibility: false,
+            managed_publication: false,
+            reveal_response: false,
+        });
+    }
+
+    let authenticated = auth_context.is_some_and(|context| {
+        context
+            .access_token
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            && context
+                .tenant_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            && context
+                .project_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+    });
+    if !authenticated {
+        return Err(ProvenanceError::InvalidEnv(
+            "provenance publication and response reveal require an authenticated tenant/project request"
+                .to_string(),
+        ));
+    }
+
+    let public_visibility = configured_visibility == "public";
+    if !public_visibility && !managed_publication_capability {
+        return Err(ProvenanceError::InvalidEnv(
+            "provenance publication was requested but no deployment publication capability is enabled"
+                .to_string(),
+        ));
+    }
+    if consent.reveal_response && (!managed_publication_capability || !response_reveal_capability) {
+        return Err(ProvenanceError::InvalidEnv(
+            "provenance response reveal was requested but managed response publication is not enabled"
+                .to_string(),
+        ));
+    }
+
+    Ok(DisclosureDecision {
+        public_visibility,
+        managed_publication: managed_publication_capability,
+        reveal_response: consent.reveal_response,
+    })
+}
+
+fn validate_backend_schema(schema_id: &str, schema_version: &str) -> Result<(), ProvenanceError> {
+    if schema_id != DEFAULT_SCHEMA_ID || schema_version != DEFAULT_SCHEMA_VERSION {
+        return Err(ProvenanceError::InvalidEnv(format!(
+            "the current Livy resolver endpoint requires schema_id {DEFAULT_SCHEMA_ID} and schema_version {DEFAULT_SCHEMA_VERSION}; a future schema rollout must update the backend first"
+        )));
+    }
+    Ok(())
+}
+
+fn source_public_commitment(source: &str) -> String {
+    format!("sha256:{}", sha256_string_hex(source))
+}
+
 fn validate_publication_policy(
     visibility: &str,
     managed_publication: bool,
@@ -1244,6 +1357,8 @@ mod tests {
         assert!(!encoded.contains("Bearer secret"));
         assert!(!encoded.contains("session=secret"));
         assert!(!encoded.contains("private-agent"));
+        assert!(!encoded.contains("example.com/path"));
+        assert!(encoded.contains("sha256:"));
     }
 
     #[test]
@@ -1253,12 +1368,22 @@ mod tests {
         assert_eq!(fields[0].name, "application_domain");
         assert_eq!(fields[2].commit_mode, ProvenanceCommitMode::JsonSha256);
         assert_eq!(fields[3].disclosure, ProvenanceFieldDisclosure::Commitment);
-        assert_eq!(fields[4].commit_mode, ProvenanceCommitMode::JsonSha256);
-        assert_eq!(fields[4].disclosure, ProvenanceFieldDisclosure::Commitment);
+        assert_eq!(fields[4].commit_mode, ProvenanceCommitMode::Json);
+        assert_eq!(fields[4].disclosure, ProvenanceFieldDisclosure::Public);
         assert_eq!(ATTESTATION_CLAIM, "source");
         assert_eq!(SUBJECT_TYPE, "resolver_fetch");
-        assert_eq!(DEFAULT_SCHEMA_ID, "resolver-fetch-v2");
-        assert_eq!(DEFAULT_SCHEMA_VERSION, "2");
+        assert_eq!(DEFAULT_SCHEMA_ID, "resolver-fetch-v1");
+        assert_eq!(DEFAULT_SCHEMA_VERSION, "1");
+    }
+
+    #[test]
+    fn current_backend_schema_is_fixed_and_public_source_is_only_a_commitment() {
+        assert!(validate_backend_schema("resolver-fetch-v1", "1").is_ok());
+        assert!(validate_backend_schema("resolver-fetch-v2", "2").is_err());
+        let commitment = source_public_commitment("https://example.com/private?token=secret");
+        assert!(commitment.starts_with("sha256:"));
+        assert!(!commitment.contains("example.com"));
+        assert!(!commitment.contains("secret"));
     }
 
     #[test]
@@ -1284,6 +1409,49 @@ mod tests {
         assert!(validate_publication_policy("private", true, false, false).is_err());
         assert!(validate_publication_policy("private", false, true, true).is_err());
         assert!(validate_publication_policy("public", true, true, true).is_ok());
+    }
+
+    #[test]
+    fn request_consent_and_auth_are_both_required_for_publication() {
+        let authenticated = ResolverAuthContext {
+            access_token: Some("token".to_string()),
+            client_id: Some("client".to_string()),
+            scopes: vec![],
+            audiences: vec![],
+            tenant_id: Some("tenant".to_string()),
+            project_id: Some("project".to_string()),
+        };
+        let publish = ProvenanceConsent {
+            publish: true,
+            reveal_response: false,
+        };
+        let reveal = ProvenanceConsent {
+            publish: true,
+            reveal_response: true,
+        };
+
+        assert_eq!(
+            disclosure_decision("public", true, true, None, Some(&authenticated)).unwrap(),
+            DisclosureDecision {
+                public_visibility: false,
+                managed_publication: false,
+                reveal_response: false,
+            }
+        );
+        assert!(disclosure_decision("public", true, true, Some(&publish), None).is_err());
+        assert_eq!(
+            disclosure_decision("public", true, true, Some(&reveal), Some(&authenticated),)
+                .unwrap(),
+            DisclosureDecision {
+                public_visibility: true,
+                managed_publication: true,
+                reveal_response: true,
+            }
+        );
+        assert!(
+            disclosure_decision("public", true, false, Some(&reveal), Some(&authenticated),)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1358,13 +1526,11 @@ mod tests {
 
     #[test]
     fn response_artifact_contains_request_response_and_commitments() {
-        let request = json!({
-            "route": "fetch",
-            "mode": "fast",
-            "source": "https://example.com/article",
-            "header_count": 1,
-            "cookies_present": true,
-        });
+        let request = request_summary(
+            &ProductRequest::fast("https://example.com/private-article"),
+            ProductRoute::Scrape,
+            ProductMode::Fast,
+        );
         let response = json!([{
             "status": 200,
             "content": "verified source text",
@@ -1390,6 +1556,7 @@ mod tests {
         assert_eq!(artifact["response"], response);
         assert_eq!(artifact["commitments"]["request_sha256"], request_sha256);
         assert_eq!(artifact["commitments"]["response_sha256"], response_sha256);
+        assert!(!String::from_utf8_lossy(&bytes).contains("private-article"));
     }
 
     #[test]

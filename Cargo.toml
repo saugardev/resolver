@@ -9,6 +9,7 @@ default = ["mcp"]
 mcp = []
 
 [dependencies]
+async-trait = "0.1.89"
 axum = {version = "0.8.9" , features = ["macros"]}
 dotenvy = "0.15.7"
 hex = "0.4.3"
