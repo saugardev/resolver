@@ -418,10 +418,17 @@ fn capability_unavailable(detail: &str) -> FetchError {
 fn is_public_ip(address: IpAddr) -> bool {
     if let IpAddr::V6(address) = address {
         let octets = address.octets();
-        // Deny the entire IPv4-mapped/translatable prefix. Allowing a mapped public IPv4 value
-        // creates parser and policy disagreements at downstream network boundaries.
-        if octets[..10].iter().all(|octet| *octet == 0) && octets[10] == 0xff && octets[11] == 0xff
-        {
+        // Deny both IPv4-embedded layouts in full, including otherwise-public embedded values:
+        // IPv4-mapped `::ffff:<IPv4>` and RFC 6052 IPv4-translatable `::ffff:0:<IPv4>`.
+        let is_ipv4_mapped = octets[..10].iter().all(|octet| *octet == 0)
+            && octets[10] == 0xff
+            && octets[11] == 0xff;
+        let is_ipv4_translatable = octets[..8].iter().all(|octet| *octet == 0)
+            && octets[8] == 0xff
+            && octets[9] == 0xff
+            && octets[10] == 0
+            && octets[11] == 0;
+        if is_ipv4_mapped || is_ipv4_translatable {
             return false;
         }
         if let Some(embedded) = address.to_ipv4() {
@@ -586,13 +593,27 @@ mod tests {
     }
 
     #[test]
-    fn entire_ipv4_translatable_prefix_is_blocked() {
+    fn entire_ipv4_mapped_prefix_is_blocked() {
         for address in [
             "::ffff:169.254.169.254", // metadata/link-local
             "::ffff:10.0.0.1",        // RFC 1918
             "::ffff:100.64.0.1",      // CGNAT
             "::ffff:93.184.216.34",   // otherwise-public control
             "::ffff:8.8.8.8",         // otherwise-public control
+        ] {
+            let address = address.parse().expect("test address");
+            assert!(!is_public_ip(IpAddr::V6(address)), "{address}");
+        }
+    }
+
+    #[test]
+    fn entire_rfc_ipv4_translatable_prefix_is_blocked() {
+        for address in [
+            "::ffff:0:169.254.169.254", // metadata/link-local
+            "::ffff:0:10.0.0.1",        // RFC 1918 10/8
+            "::ffff:0:192.168.1.1",     // RFC 1918 192.168/16
+            "::ffff:0:100.64.0.1",      // CGNAT
+            "::ffff:0:93.184.216.34",   // otherwise-public control
         ] {
             let address = address.parse().expect("test address");
             assert!(!is_public_ip(IpAddr::V6(address)), "{address}");
@@ -631,6 +652,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn rfc_ipv4_translatable_literal_urls_are_rejected_at_the_handler_boundary() {
+        let policy = EgressPolicy::for_tests(&[], true);
+        for source in [
+            "http://[::ffff:0:169.254.169.254]/",
+            "http://[::ffff:0:10.0.0.1]/",
+            "http://[::ffff:0:192.168.1.1]/",
+            "http://[::ffff:0:100.64.0.1]/",
+            "http://[::ffff:0:93.184.216.34]/",
+        ] {
+            assert!(policy.validate_source(source).await.is_err(), "{source}");
+        }
     }
 
     #[tokio::test]
