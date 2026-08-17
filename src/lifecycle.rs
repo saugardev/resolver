@@ -19,6 +19,12 @@ pub struct RuntimeState {
     accepting_requests: AtomicBool,
 }
 
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimeState {
     pub fn new() -> Self {
         Self {

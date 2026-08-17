@@ -525,4 +525,225 @@ mod mcp_runtime_tests {
             .expect("service response");
         assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
+
+    #[tokio::test]
+    async fn exact_origin_middleware_rejects_non_default_port_before_rmcp() {
+        let runtime = config::McpRuntimeConfig {
+            allowed_hosts: vec!["resolver.example".into()],
+            allowed_origins: vec!["https://app.example".into()],
+        };
+        let service = StreamableHttpService::new(
+            || Ok::<_, std::io::Error>(TestServer),
+            NeverSessionManager::default().into(),
+            mcp_config(&runtime),
+        );
+        let app =
+            Router::new()
+                .route_service("/mcp", service)
+                .layer(middleware::from_fn_with_state(
+                    runtime,
+                    security::exact_mcp_origin,
+                ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "resolver.example")
+                    .header("origin", "https://app.example:4444")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("service response");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn direct_json_tools_list_is_enriched_end_to_end() {
+        let runtime = config::McpRuntimeConfig {
+            allowed_hosts: vec!["resolver.example".into()],
+            allowed_origins: vec!["https://app.example".into()],
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let evidence = Arc::new(AtomicUsize::new(0));
+        let service = StreamableHttpService::new(
+            {
+                let cancelled = cancelled.clone();
+                let evidence = evidence.clone();
+                move || {
+                    Ok::<_, std::io::Error>(TestToolServer::new(
+                        cancelled.clone(),
+                        evidence.clone(),
+                    ))
+                }
+            },
+            NeverSessionManager::default().into(),
+            mcp_config(&runtime),
+        );
+        let app = Router::new()
+            .route_service("/mcp", service)
+            .layer(middleware::from_fn(mcp::mirror_tools_list_security_schemes));
+        let response = app
+            .oneshot(mcp_request(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+            ))
+            .await
+            .expect("tools/list response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            response.headers()[axum::http::header::CONTENT_TYPE]
+                .to_str()
+                .expect("content type")
+                .starts_with("application/json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        let tool = &value["result"]["tools"][0];
+        assert_eq!(tool["name"], "fetch_source");
+        assert_eq!(tool["title"], "Fetch Source");
+        assert_eq!(tool["securitySchemes"][0]["type"], "oauth2");
+        assert_eq!(tool["_meta"]["securitySchemes"][0]["type"], "oauth2");
+        assert!(tool["outputSchema"].is_object());
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(tool["annotations"]["destructiveHint"], true);
+        assert_eq!(tool["annotations"]["openWorldHint"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_timeout_cancels_and_awaits_slow_upstream_work() {
+        let runtime = config::McpRuntimeConfig {
+            allowed_hosts: vec!["resolver.example".into()],
+            allowed_origins: vec!["https://app.example".into()],
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let evidence = Arc::new(AtomicUsize::new(0));
+        let service = StreamableHttpService::new(
+            {
+                let cancelled = cancelled.clone();
+                let evidence = evidence.clone();
+                move || {
+                    Ok::<_, std::io::Error>(TestToolServer::new(
+                        cancelled.clone(),
+                        evidence.clone(),
+                    ))
+                }
+            },
+            NeverSessionManager::default().into(),
+            mcp_config(&runtime),
+        );
+        let security = config::SecurityConfig {
+            product_body_bytes: config::DEFAULT_PRODUCT_BODY_BYTES,
+            product_timeout: Duration::from_secs(1),
+            mcp_timeout: Duration::from_millis(20),
+            shutdown_grace: Duration::from_secs(1),
+            hsts_enabled: false,
+        };
+        let app =
+            Router::new()
+                .route_service("/mcp", service)
+                .layer(middleware::from_fn_with_state(
+                    security,
+                    security::mcp_timeout,
+                ));
+        let response = app
+            .oneshot(mcp_request(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_source","arguments":{}}}"#,
+            ))
+            .await
+            .expect("tools/call response");
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(evidence.load(Ordering::Acquire), 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(evidence.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_deadline_bounds_stalled_body_and_drops_downstream() {
+        let runtime = config::McpRuntimeConfig {
+            allowed_hosts: vec!["resolver.example".into()],
+            allowed_origins: vec!["https://app.example".into()],
+        };
+        let service = StreamableHttpService::new(
+            || Ok::<_, std::io::Error>(TestServer),
+            NeverSessionManager::default().into(),
+            mcp_config(&runtime),
+        );
+        let security = config::SecurityConfig {
+            product_body_bytes: config::DEFAULT_PRODUCT_BODY_BYTES,
+            product_timeout: Duration::from_secs(1),
+            mcp_timeout: Duration::from_millis(20),
+            shutdown_grace: Duration::from_secs(1),
+            hsts_enabled: false,
+        };
+        let app =
+            Router::new()
+                .route_service("/mcp", service)
+                .layer(middleware::from_fn_with_state(
+                    security,
+                    security::mcp_timeout,
+                ));
+
+        let body_dropped = Arc::new(AtomicBool::new(false));
+        let drop_flag = DropFlag(body_dropped.clone());
+        let stalled_body = futures_util::stream::poll_fn(
+            move |_| -> Poll<Option<std::result::Result<String, Infallible>>> {
+                let _keep_drop_flag_alive = &drop_flag;
+                Poll::Pending
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "resolver.example")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(
+                axum::http::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .body(Body::from_stream(stalled_body))
+            .expect("stalled MCP request");
+
+        let started = Instant::now();
+        let response = app.oneshot(request).await.expect("timeout response");
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(body_dropped.load(Ordering::Acquire));
+    }
+
+    fn mcp_request(body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "resolver.example")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(
+                axum::http::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .body(Body::from(body))
+            .expect("MCP request")
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_readiness_and_cancels_mcp() {
+        let state = Arc::new(lifecycle::RuntimeState::new());
+        let egress = Arc::new(egress::EgressPolicy::for_tests(&[], true));
+        state.mark_ready();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+
+        begin_shutdown(&state, &cancellation);
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            lifecycle::readiness(Extension(state), Extension(egress))
+                .await
+                .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
