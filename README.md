@@ -165,7 +165,53 @@ Response shape:
 }
 ```
 
-Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|crawl|map|search|extract|screenshot`), `format`, `proxy`, `receipt`, and optional consent `provenance: { "publish": false, "reveal_response": false }`.
+Request fields include `source`, `query`/`q`, `mode`, `format`, `proxy`, and
+`receipt`, plus optional consent
+`provenance: { "publish": false, "reveal_response": false }`. The mode
+contract is route-specific:
+
+- `/fetch` accepts `auto`, `fast`, `browser`, `unblock`, or `raw`.
+- `/crawl`, `/map`, `/search`, `/extract`, and `/screenshot` accept `auto` or
+  their route-named mode. Other combinations return `400` instead of running a
+  different operation under the requested label.
+- `proxy` accepts `auto`, `none`, `isp`, `residential`, or `mobile`.
+  `proxy_enabled` is deprecated and rejected. `auto` uses ISP for
+  auto/fast/extract/unblock and no proxy for the other modes.
+
+Auto and fast requests perform at most one unblock fallback during the current
+request when the first response is a recognized browser, JavaScript, robots, or
+human-verification challenge. HTTP or payload status `401`, `403`, or `429` can
+be challenge-eligible; redirects and `5xx` responses are always terminal even
+when their body contains challenge text. Both attempts share one deadline and
+only the final successful result can create a receipt or provenance record.
+
+Authenticated requests use this billing order: validate the request, perform a
+non-consuming balance/entitlement preflight, obtain and validate a pending
+Spider result, capture the idempotent credit debit, then create the receipt and
+provenance record and return the result. Insufficient balance therefore prevents
+Spider work, while an upstream HTTP/payload failure, timeout, or oversized body
+cannot produce a captured debit, receipt, or provenance record. A capture
+failure after successful Spider work also prevents finalization.
+
+The current backend does not expose atomic reserve/capture/cancel operations.
+Consequently, the balance can change after preflight, and some valid Spider work
+can be consumed before an authoritative capture loses that race. Closing that
+cost-abuse window requires a backend reservation before Spider, followed by
+capture on success or cancellation on failure.
+
+`Idempotency-Key` is scoped to the authenticated tenant, project, and client and
+bound to a canonical fingerprint of the full execution plan. The resolver fails
+closed with `409` when a completed key is replayed because the credit backend can
+return the prior debit but cannot return or authoritatively bind the prior
+resolver result, receipt, and provenance. The complete backend enhancement is an
+atomic operation API that reserves a caller key and fingerprint, captures or
+cancels that reservation, and returns the original resolver result/evidence
+reference on replay. Until it exists, the resolver uses a bounded local conflict
+registry and accepts only a debit response carrying a ledger record bound to
+the exact request fingerprint, pricing version, amount, project, idempotency
+key, and unique capture attempt. It never treats a generic ledger listing as
+proof that work may proceed. Cross-process caller-key races and an ambiguous
+capture without a caller key remain residual limitations.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -175,6 +221,7 @@ Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|cr
 | POST | `/search` | Web search (+ optional page fetch) |
 | POST | `/extract` | Extraction with selectors |
 | POST | `/screenshot` | Capture screenshot |
+| POST | `/snapshot` | Capture raw HTML and screenshot with one resolver receipt |
 | POST | `/fetchfast` | Compat: fast fetch |
 | POST | `/fetchunblock` | Compat: unblock fetch |
 | GET | `/receipt/{id}` | Read receipt |
@@ -232,8 +279,16 @@ these deployment safety limits with:
 ```dotenv
 LIVY_RESOLVER_MAX_PRODUCT_BODY_BYTES=65536
 LIVY_RESOLVER_PRODUCT_TIMEOUT_SECS=65
+LIVY_RESOLVER_MAX_UPSTREAM_BYTES=8388608
 LIVY_RESOLVER_HSTS_ENABLED=false
 ```
+
+Spider calls have a five-second connect timeout, a 65-second client ceiling,
+the request's `timeout_secs` absolute deadline (1–60 seconds), and the response
+limit above. Redirect following is disabled, so control-plane 3xx responses are
+errors even when their target would return 2xx. Every non-2xx response and every
+payload item whose source `status` is outside 200–299 maps to an upstream error
+before credit capture, receipt creation, or provenance creation.
 
 Enable HSTS only when the public endpoint is served through HTTPS. The API
 accepts absolute HTTP and HTTPS source URLs, including localhost and private

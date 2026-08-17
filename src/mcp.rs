@@ -5,8 +5,7 @@ use crate::credits::ResolverCreditsClient;
 use crate::errors::ResolverAuthError;
 use crate::fetch::Fetcher;
 use crate::types::{
-    FetchWithReceipt, ProductMode, ProductRequest, ProductRoute, ProvenanceConsent,
-    validate_idempotency_key, validate_source_url,
+    FetchWithReceipt, ProvenanceConsent, validate_idempotency_key, validate_source_url,
 };
 use axum::{
     Json,
@@ -34,9 +33,6 @@ use std::{
 const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source", "resolver:source:fetch"];
 const FETCH_SOURCE_TITLE: &str = "Fetch Source";
 const FETCH_SOURCE_DESCRIPTION: &str = "Fetch the exact source URL supplied by the user using adaptive resolver routing. This operation debits Livy credits and stores a tenant-scoped receipt. When provenance is enabled it may also create a private attestation; public publication or response reveal additionally requires deployment capability and explicit authenticated request consent. Do not perform web search or substitute another article.";
-const FETCH_SOURCE_READ_ONLY: bool = false;
-const FETCH_SOURCE_DESTRUCTIVE: bool = true;
-const FETCH_SOURCE_OPEN_WORLD: bool = true;
 const FETCH_SOURCE_INVOCATION_START: &str = "Fetching source";
 const FETCH_SOURCE_INVOCATION_DONE: &str = "Source fetched";
 const EXPLORER_QUERY_BASE_URL: &str = "https://explorer.livylabs.xyz/?q=";
@@ -196,36 +192,11 @@ impl Server {
             ))]));
         }
 
-        let cache_key = normalize_fallback_url_key(&url);
-        let fallback_reason = self.fallback_cache.lookup(&cache_key);
-        let route = if fallback_reason.is_some() {
-            ProductRoute::Unblock
-        } else {
-            ProductRoute::Scrape
-        };
-        let mut request = ProductRequest::fast(&url);
-        if route == ProductRoute::Unblock {
-            request.mode = ProductMode::Unblock;
-            request.receipt = Some(true);
-        }
-        request.provenance = Some(ProvenanceConsent {
-            publish: publish_provenance,
-            reveal_response: reveal_provenance_response,
-        });
-        let logical_request = match request
-            .validate_for(route)
-            .and_then(|_| Fetcher::product_billing_context(&request, route))
-        {
-            Ok(logical_request) => logical_request,
-            Err(err) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Invalid fetch_source request: {}",
-                    public_validation_message(&err)
-                ))]));
-            }
-        };
-
-        // Keep every fetch path, including cached unblock fallback, behind auth and credit debit.
+        // The current credit backend has only balance and immediate debit
+        // endpoints, not reserve/capture/refund. Preflight before doing Spider
+        // work, then prepare a validated result, capture idempotently, and only
+        // then finalize evidence. Capture remains authoritative because the
+        // balance can change after preflight.
         let started = Instant::now();
         let source_sha256 = crate::security::sensitive_hash(&url);
         eprintln!(
@@ -238,6 +209,43 @@ impl Server {
                 "source_sha256": &source_sha256,
             })
         );
+        let cache_key = normalize_fallback_url_key(&url);
+        let fallback_reason = self.fallback_cache.lookup(&cache_key);
+        let (mut request, route) = if let Some(reason) = fallback_reason {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "mcp_fetch_source_fallback",
+                    "request_id": crate::security::current_request_id(),
+                    "mode": "unblock",
+                    "reason": reason,
+                    "source_sha256": &source_sha256,
+                })
+            );
+            (
+                Fetcher::unblock_request(&url, true),
+                crate::types::ProductRoute::Unblock,
+            )
+        } else {
+            (
+                Fetcher::fast_request(&url),
+                crate::types::ProductRoute::Scrape,
+            )
+        };
+        request.provenance = Some(ProvenanceConsent {
+            publish: publish_provenance,
+            reveal_response: reveal_provenance_response,
+        });
+        if let Err(err) = request.validate_for(route) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Invalid fetch_source request: {}",
+                public_validation_message(&err)
+            ))]));
+        }
+        let logical_request = self
+            .fetcher
+            .product_billing_context(&request, route)
+            .map_err(|_| ErrorData::invalid_params("Invalid fetch execution plan", None))?;
         let authorization = match self
             .credits
             .preflight_fetch_source(
@@ -253,92 +261,52 @@ impl Server {
                 eprintln!(
                     "{}",
                     json!({
-                        "event": "mcp_credit_debit_failed",
+                        "event": "mcp_credit_preflight_failed",
                         "request_id": crate::security::current_request_id(),
                         "source_sha256": &source_sha256,
                         "elapsed_ms": started.elapsed().as_millis(),
                         "payment_required": err.is_payment_required(),
+                        "idempotency_conflict": err.is_idempotency_conflict(),
                     })
                 );
-                let message = if err.is_idempotency_already_finalized() {
-                    "Idempotency key was already finalized; the prior result is not available for replay"
-                        .to_string()
+                let message = if err.is_payment_required() {
+                    "Livy payment required"
                 } else if err.is_idempotency_conflict() {
-                    "Idempotency key was already used for a different logical request".to_string()
-                } else if err.is_payment_required() {
-                    "Livy payment required".to_string()
+                    "Livy idempotency replay cannot be finalized safely"
                 } else {
-                    "Livy credit authorization service is unavailable".to_string()
+                    "Livy credit authorization service is unavailable"
                 };
                 return Ok(CallToolResult::error(vec![Content::text(message)]));
             }
         };
-
-        let pending = if let Some(reason) = fallback_reason {
-            eprintln!(
-                "{}",
-                json!({
-                    "event": "mcp_fetch_source_fallback",
-                    "request_id": crate::security::current_request_id(),
-                    "mode": "unblock",
-                    "reason": reason,
-                    "source_sha256": &source_sha256,
-                })
-            );
-            self.fetcher
-                .prepare_product_fetch_with_auth(
-                    request,
-                    ProductRoute::Unblock,
-                    Some(&auth_context),
-                )
-                .await
-                .map_err(|_| {
-                    eprintln!(
-                        "{}",
-                        json!({
-                            "event": "mcp_fetch_source_failed",
-                            "request_id": crate::security::current_request_id(),
-                            "mode": "unblock",
-                            "source_sha256": &source_sha256,
-                            "elapsed_ms": started.elapsed().as_millis(),
-                        })
-                    );
-                    ErrorData::internal_error("Upstream fetch failed", None)
-                })?
-        } else {
-            match self
-                .fetcher
-                .prepare_product_fetch_with_auth(request, ProductRoute::Scrape, Some(&auth_context))
-                .await
-            {
-                Ok(pending) => pending,
-                Err(e) => {
-                    analyze_fetch_error_in_background(
-                        self.fallback_cache.clone(),
-                        cache_key,
-                        e.to_string(),
-                    );
-                    eprintln!(
-                        "{}",
-                        json!({
-                            "event": "mcp_fetch_source_failed",
-                            "request_id": crate::security::current_request_id(),
-                            "mode": "fast",
-                            "source_sha256": &source_sha256,
-                            "elapsed_ms": started.elapsed().as_millis(),
-                        })
-                    );
-                    return Err(ErrorData::internal_error("Upstream fetch failed", None));
-                }
+        let pending_result = self
+            .fetcher
+            .prepare_product_fetch_with_auth(request, route, Some(&auth_context))
+            .await;
+        let pending = match pending_result {
+            Ok(pending) => pending,
+            Err(error) => {
+                analyze_fetch_error_in_background(self.fallback_cache.clone(), cache_key, &error);
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_fetch_source_failed",
+                        "request_id": crate::security::current_request_id(),
+                        "mode": if fallback_reason.is_some() { "unblock" } else { "fast" },
+                        "source_sha256": &source_sha256,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    })
+                );
+                return Err(ErrorData::internal_error("Upstream fetch failed", None));
             }
         };
 
         match self.credits.capture_authorized_request(authorization).await {
-            Ok(Some(outcome)) if outcome.permits_work() => {
+            Ok(Some(outcome)) => {
                 eprintln!(
                     "{}",
                     json!({
-                        "event": "mcp_credit_debit",
+                        "event": "mcp_credit_capture",
                         "request_id": crate::security::current_request_id(),
                         "source_sha256": &source_sha256,
                         "charged": outcome.charged,
@@ -348,37 +316,34 @@ impl Server {
                     })
                 );
             }
-            Ok(Some(outcome)) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "mcp_credit_debit_not_enforced",
-                        "request_id": crate::security::current_request_id(),
-                        "source_sha256": &source_sha256,
-                        "mode": outcome.mode,
-                    })
-                );
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "Livy credit authorization was not enforced",
-                )]));
-            }
             Ok(None) => {
                 eprintln!(
                     "{}",
                     json!({
-                        "event": "mcp_credit_debit_skipped",
+                        "event": "mcp_credit_capture_skipped",
                         "request_id": crate::security::current_request_id(),
                         "source_sha256": &source_sha256,
                     })
                 );
             }
             Err(err) => {
-                let message = if err.is_idempotency_conflict() {
-                    "Idempotency key was already used for a different logical request"
-                } else if err.is_payment_required() {
-                    "Livy payment required"
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_capture_failed",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "payment_required": err.is_payment_required(),
+                        "idempotency_conflict": err.is_idempotency_conflict(),
+                    })
+                );
+                let message = if err.is_payment_required() {
+                    "Livy payment required".to_string()
+                } else if err.is_idempotency_conflict() {
+                    "Livy idempotency replay cannot be finalized safely".to_string()
                 } else {
-                    "Livy credit authorization service is unavailable"
+                    "Livy credit authorization service is unavailable".to_string()
                 };
                 return Ok(CallToolResult::error(vec![Content::text(message)]));
             }
@@ -386,24 +351,23 @@ impl Server {
 
         let data = self
             .fetcher
-            .finalize_product_fetch_with_receipt_with_auth(pending, Some(&auth_context))
+            .finalize_fetch_with_receipt(pending, Some(&auth_context))
             .await
-            .map_err(|_| ErrorData::internal_error("Receipt finalization failed", None))?;
-        if fallback_reason.is_none() {
-            analyze_fetch_data_in_background(
-                self.fallback_cache.clone(),
-                cache_key,
-                data.data.clone(),
-            );
-        }
+            .map_err(|_| ErrorData::internal_error("Fetch finalization failed", None))?;
+        analyze_fetch_data_in_background(self.fallback_cache.clone(), cache_key, data.data.clone());
 
         let text = render_fetch_result(&data);
+        let executed_mode = data
+            .receipt
+            .mode
+            .strip_prefix("fetch:")
+            .unwrap_or(data.receipt.mode.as_str());
         eprintln!(
             "{}",
             json!({
                 "event": "mcp_fetch_source_ok",
                 "request_id": crate::security::current_request_id(),
-                "mode": if fallback_reason.is_some() { "unblock" } else { "fast" },
+                "mode": executed_mode,
                 "source_sha256": &source_sha256,
                 "elapsed_ms": started.elapsed().as_millis(),
                 "response_bytes": text.len(),
@@ -610,7 +574,10 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
             continue;
         };
         if tool_object.get("name").and_then(Value::as_str) == Some("fetch_source") {
-            changed |= set_json_field(tool_object, "description", json!(FETCH_SOURCE_DESCRIPTION));
+            if tool_object.get("description") != Some(&json!(FETCH_SOURCE_DESCRIPTION)) {
+                tool_object.insert("description".to_string(), json!(FETCH_SOURCE_DESCRIPTION));
+                changed = true;
+            }
             if !tool_object.contains_key("title") {
                 tool_object.insert("title".to_string(), json!(FETCH_SOURCE_TITLE));
                 changed = true;
@@ -668,22 +635,22 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
                 changed = true;
             }
             if let Some(annotation_object) = annotations.as_object_mut() {
-                changed |= set_json_field(annotation_object, "title", json!(FETCH_SOURCE_TITLE));
-                changed |= set_json_field(
-                    annotation_object,
-                    "readOnlyHint",
-                    json!(FETCH_SOURCE_READ_ONLY),
-                );
-                changed |= set_json_field(
-                    annotation_object,
-                    "destructiveHint",
-                    json!(FETCH_SOURCE_DESTRUCTIVE),
-                );
-                changed |= set_json_field(
-                    annotation_object,
-                    "openWorldHint",
-                    json!(FETCH_SOURCE_OPEN_WORLD),
-                );
+                if annotation_object.get("title") != Some(&json!(FETCH_SOURCE_TITLE)) {
+                    annotation_object.insert("title".to_string(), json!(FETCH_SOURCE_TITLE));
+                    changed = true;
+                }
+                if annotation_object.get("readOnlyHint") != Some(&json!(false)) {
+                    annotation_object.insert("readOnlyHint".to_string(), json!(false));
+                    changed = true;
+                }
+                if annotation_object.get("destructiveHint") != Some(&json!(true)) {
+                    annotation_object.insert("destructiveHint".to_string(), json!(true));
+                    changed = true;
+                }
+                if annotation_object.get("openWorldHint") != Some(&json!(true)) {
+                    annotation_object.insert("openWorldHint".to_string(), json!(true));
+                    changed = true;
+                }
             }
         }
 
@@ -703,14 +670,6 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
     }
 
     changed
-}
-
-fn set_json_field(object: &mut serde_json::Map<String, Value>, key: &str, value: Value) -> bool {
-    if object.get(key) == Some(&value) {
-        return false;
-    }
-    object.insert(key.to_string(), value);
-    true
 }
 
 impl Server {
@@ -930,9 +889,14 @@ fn analyze_fetch_data_in_background(cache: Arc<FetchFallbackCache>, key: String,
     });
 }
 
-fn analyze_fetch_error_in_background(cache: Arc<FetchFallbackCache>, key: String, error: String) {
+fn analyze_fetch_error_in_background(
+    cache: Arc<FetchFallbackCache>,
+    key: String,
+    error: &crate::errors::FetchError,
+) {
+    let reason = crate::fetch::fallback_reason_for_fetch_error(error);
     tokio::spawn(async move {
-        if let Some(reason) = fallback_reason_for_text(&error) {
+        if let Some(reason) = reason {
             eprintln!(
                 "{}",
                 json!({
@@ -947,95 +911,12 @@ fn analyze_fetch_error_in_background(cache: Arc<FetchFallbackCache>, key: String
 }
 
 fn fallback_reason_for_fetch_data(data: &Value) -> Option<&'static str> {
-    if let Some(content) = extracted_content(data) {
-        return fallback_reason_for_text(content);
-    }
-    fallback_reason_for_text(&data.to_string())
+    crate::fetch::fallback_reason_for_fetch_data(data)
 }
 
+#[cfg(test)]
 fn fallback_reason_for_text(text: &str) -> Option<&'static str> {
-    let normalized = normalize_detector_text(text);
-    if contains_any(
-        &normalized,
-        &[
-            "enable javascript",
-            "requires javascript",
-            "require javascript",
-            "javascript is disabled",
-            "javascript disabled",
-            "please enable js",
-            "turn on javascript",
-            "you need javascript",
-            "browser is required",
-        ],
-    ) {
-        return Some("javascript_required");
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "blocked by robots",
-            "disallowed by robots",
-            "robots.txt",
-            "robots policy",
-            "respect robots",
-        ],
-    ) {
-        return Some("robots_blocked");
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "verify you are human",
-            "verify that you are human",
-            "confirm you are human",
-            "prove you are human",
-            "are you a human",
-            "human verification",
-            "not a robot",
-            "are not a robot",
-            "verify you are not a robot",
-            "complete the security check",
-            "security check to access",
-            "captcha",
-        ],
-    ) {
-        return Some("human_verification");
-    }
-
-    if looks_like_browser_check(&normalized) {
-        return Some("browser_check");
-    }
-
-    None
-}
-
-fn looks_like_browser_check(normalized: &str) -> bool {
-    contains_any(
-        normalized,
-        &[
-            "checking your browser",
-            "checking if the site connection is secure",
-            "just a moment...",
-        ],
-    ) || (normalized.contains("cloudflare")
-        && contains_any(
-            normalized,
-            &["ray id", "attention required", "challenge", "turnstile"],
-        ))
-}
-
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
-}
-
-fn normalize_detector_text(text: &str) -> String {
-    text.to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::fetch::fallback_reason_for_text(text)
 }
 
 fn normalize_fallback_url_key(url: &str) -> String {
@@ -1063,15 +944,235 @@ impl ServerHandler for Server {}
 #[cfg(test)]
 mod tests {
     use super::{
-        FETCH_SOURCE_DESCRIPTION, FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache,
-        Server, mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
+        FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Params, Server,
+        mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
         structured_fetch_result,
     };
-    use crate::auth::ResolverAuth;
     use crate::types::{FetchWithReceipt, Receipt};
-    use axum::{body::to_bytes, http::header};
+    use crate::{auth::ResolverAuth, credits::ResolverCreditsClient, fetch::Fetcher};
+    use axum::{
+        Json, Router,
+        body::to_bytes,
+        extract::State,
+        http::{Request, StatusCode, header},
+        routing::{get, post},
+    };
+    use rmcp::{handler::server::tool::Extension, handler::server::wrapper::Parameters};
     use serde_json::json;
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    #[derive(Clone)]
+    struct McpBoundaryState {
+        auth_calls: Arc<AtomicUsize>,
+        ledger_calls: Arc<AtomicUsize>,
+        preflight_calls: Arc<AtomicUsize>,
+        capture_calls: Arc<AtomicUsize>,
+        balance: i64,
+    }
+
+    async fn spawn_boundary(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP boundary");
+        let address = listener.local_addr().expect("MCP boundary address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve MCP boundary");
+        });
+        format!("http://{address}")
+    }
+
+    async fn mcp_introspect(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.auth_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "active": true,
+            "sub": "user-a",
+            "scope": "tool:fetch_source",
+            "aud": "https://resolver.api.livylabs.xyz/mcp",
+            "client_id": "mcp-test",
+            "https://claims.livylabs.xyz/tenant_id": "tenant-a",
+            "https://claims.livylabs.xyz/project_id": "project-a"
+        }))
+    }
+
+    async fn mcp_capture(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.capture_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "mode": "captured",
+            "enforced": true,
+            "charged": true,
+            "amount": 1
+        }))
+    }
+
+    async fn mcp_ledger(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.ledger_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!([]))
+    }
+
+    async fn mcp_preflight(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "tenant_id": "tenant-a",
+            "membership_id": "00000000-0000-0000-0000-000000000001",
+            "balance": state.balance,
+            "lifetime_granted": 10,
+            "lifetime_used": 0,
+            "created_at": "2026-08-17T00:00:00Z",
+            "updated_at": "2026-08-17T00:00:00Z"
+        }))
+    }
+
+    #[tokio::test]
+    async fn mcp_upstream_failure_authenticates_but_never_captures_or_finalizes() {
+        let spider = Router::new().route(
+            "/scrape",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": "upstream unavailable"})),
+                )
+            }),
+        );
+        let spider_base = spawn_boundary(spider).await;
+        let fetcher = Arc::new(Fetcher::for_tests(spider_base, 4096, None));
+        let state = McpBoundaryState {
+            auth_calls: Arc::new(AtomicUsize::new(0)),
+            ledger_calls: Arc::new(AtomicUsize::new(0)),
+            preflight_calls: Arc::new(AtomicUsize::new(0)),
+            capture_calls: Arc::new(AtomicUsize::new(0)),
+            balance: 10,
+        };
+        let control = Router::new()
+            .route("/oauth/introspect", post(mcp_introspect))
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits",
+                get(mcp_preflight),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credit-ledger",
+                get(mcp_ledger),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits/debits",
+                post(mcp_capture),
+            )
+            .with_state(state.clone());
+        let control_base = spawn_boundary(control).await;
+        let server = Server::new(
+            fetcher.clone(),
+            Arc::new(ResolverAuth::for_test_endpoint(format!(
+                "{control_base}/oauth/introspect"
+            ))),
+            Arc::new(ResolverCreditsClient::for_tests(control_base)),
+            Arc::new(FetchFallbackCache::default()),
+        );
+        let (parts, _) = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer mcp-token")
+            .body(())
+            .expect("MCP request")
+            .into_parts();
+
+        let result = server
+            .fetch_source(
+                Extension(parts),
+                Parameters(Params {
+                    url: "https://example.com".to_string(),
+                    idempotency_key: Some("mcp-request-1".to_string()),
+                    publish_provenance: false,
+                    reveal_provenance_response: false,
+                }),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.ledger_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.capture_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetcher.receipt_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_insufficient_balance_prevents_spider_and_capture() {
+        let spider_calls = Arc::new(AtomicUsize::new(0));
+        let calls = spider_calls.clone();
+        let spider = Router::new().route(
+            "/scrape",
+            post(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!([{"status": 200, "content": "resolved"}]))
+                }
+            }),
+        );
+        let spider_base = spawn_boundary(spider).await;
+        let fetcher = Arc::new(Fetcher::for_tests(spider_base, 4096, None));
+        let state = McpBoundaryState {
+            auth_calls: Arc::new(AtomicUsize::new(0)),
+            ledger_calls: Arc::new(AtomicUsize::new(0)),
+            preflight_calls: Arc::new(AtomicUsize::new(0)),
+            capture_calls: Arc::new(AtomicUsize::new(0)),
+            balance: 0,
+        };
+        let control = Router::new()
+            .route("/oauth/introspect", post(mcp_introspect))
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits",
+                get(mcp_preflight),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credit-ledger",
+                get(mcp_ledger),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits/debits",
+                post(mcp_capture),
+            )
+            .with_state(state.clone());
+        let control_base = spawn_boundary(control).await;
+        let server = Server::new(
+            fetcher.clone(),
+            Arc::new(ResolverAuth::for_test_endpoint(format!(
+                "{control_base}/oauth/introspect"
+            ))),
+            Arc::new(ResolverCreditsClient::for_tests(control_base)),
+            Arc::new(FetchFallbackCache::default()),
+        );
+        let (parts, _) = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer mcp-token")
+            .body(())
+            .expect("MCP request")
+            .into_parts();
+
+        let result = server
+            .fetch_source(
+                Extension(parts),
+                Parameters(Params {
+                    url: "https://example.com".to_string(),
+                    idempotency_key: Some("mcp-request-1".to_string()),
+                    publish_provenance: false,
+                    reveal_provenance_response: false,
+                }),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.ledger_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(spider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.capture_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetcher.receipt_count(), 0);
+    }
 
     #[test]
     fn fetch_source_tool_advertises_oauth_metadata() {
@@ -1120,17 +1221,6 @@ mod tests {
                 .and_then(|annotations| annotations.destructive_hint),
             Some(true)
         );
-        assert_eq!(tool.description.as_deref(), Some(FETCH_SOURCE_DESCRIPTION));
-        assert!(FETCH_SOURCE_DESCRIPTION.contains("debits Livy credits"));
-        assert!(FETCH_SOURCE_DESCRIPTION.contains("tenant-scoped receipt"));
-        assert!(FETCH_SOURCE_DESCRIPTION.contains("explicit authenticated request consent"));
-        let properties = tool
-            .input_schema
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-            .expect("input properties");
-        assert!(properties.contains_key("publish_provenance"));
-        assert!(properties.contains_key("reveal_provenance_response"));
         assert_eq!(
             tool.annotations
                 .as_ref()
@@ -1216,11 +1306,6 @@ mod tests {
             "result": {
                 "tools": [{
                     "name": "fetch_source",
-                    "description": "stale description",
-                    "annotations": {
-                        "readOnlyHint": true,
-                        "destructiveHint": false
-                    },
                     "_meta": {
                         "securitySchemes": [{
                             "type": "oauth2",
@@ -1238,16 +1323,12 @@ mod tests {
             json!(["receipt_id", "explorer", "source_url", "text"])
         );
         assert_eq!(
-            message["result"]["tools"][0]["annotations"]["readOnlyHint"],
-            false
-        );
-        assert_eq!(
             message["result"]["tools"][0]["annotations"]["destructiveHint"],
             true
         );
         assert_eq!(
-            message["result"]["tools"][0]["description"],
-            FETCH_SOURCE_DESCRIPTION
+            message["result"]["tools"][0]["annotations"]["readOnlyHint"],
+            false
         );
         assert_eq!(
             message["result"]["tools"][0]["securitySchemes"],

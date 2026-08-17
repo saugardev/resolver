@@ -36,7 +36,6 @@ impl SnapshotPayload {
             .ok_or(SnapshotError::MissingHtml)?;
         let screenshot_base64 = find_string_by_keys(&response, &["screenshot"])
             .ok_or(SnapshotError::MissingScreenshot)?;
-
         Ok(Self {
             source_url: source_url.to_string(),
             receipt_id,
@@ -91,32 +90,45 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn uses_the_resolver_owned_receipt_id() {
-        let snapshot = SnapshotPayload::from_spider_response(
+    fn snapshot_uses_the_resolver_owned_receipt_and_required_artifacts() {
+        let payload = SnapshotPayload::from_spider_response(
             "https://example.com",
-            "resolver-generated-id".to_string(),
-            json!({
-                "id": "predictable-upstream-id",
-                "raw": "<html></html>",
-                "screenshot": "c2NyZWVuc2hvdA=="
-            }),
+            "resolver-receipt".to_string(),
+            json!([{
+                "id": "upstream-id",
+                "status": 200,
+                "raw": "<html>snapshot</html>",
+                "screenshot": "c25hcHNob3Q="
+            }]),
             None,
-            None,
+            Some("test provenance failure".to_string()),
         )
-        .unwrap();
+        .expect("valid snapshot");
 
-        assert_eq!(snapshot.receipt_id, "resolver-generated-id");
+        assert_eq!(payload.receipt_id, "resolver-receipt");
+        assert_eq!(payload.html, "<html>snapshot</html>");
+        assert_eq!(payload.screenshot_base64, "c25hcHNob3Q=");
+        assert_eq!(
+            payload.provenance_error.as_deref(),
+            Some("test provenance failure")
+        );
     }
 
     #[test]
-    fn validates_required_snapshot_fields_before_side_effects() {
-        assert!(SnapshotPayload::validate_spider_response(&json!({"raw": "html"})).is_err());
-        assert!(
-            SnapshotPayload::validate_spider_response(&json!({
-                "raw": "html",
-                "screenshot": "bytes"
-            }))
-            .is_ok()
-        );
+    fn snapshot_validation_rejects_missing_html_or_screenshot_before_finalization() {
+        assert!(matches!(
+            SnapshotPayload::validate_spider_response(&json!([{
+                "status": 200,
+                "screenshot": "c25hcHNob3Q="
+            }])),
+            Err(SnapshotError::MissingHtml)
+        ));
+        assert!(matches!(
+            SnapshotPayload::validate_spider_response(&json!([{
+                "status": 200,
+                "raw": "<html></html>"
+            }])),
+            Err(SnapshotError::MissingScreenshot)
+        ));
     }
 }

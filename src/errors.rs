@@ -20,6 +20,16 @@ pub enum FetchError {
     Http(String),
     #[error("Upstream fetch failed")]
     Upstream(String),
+    #[error("Upstream fetch returned HTTP {status}")]
+    UpstreamStatus { status: StatusCode, body: String },
+    #[error("Upstream payload reported a failed fetch")]
+    UpstreamPayload {
+        status: Option<i64>,
+        error: Option<String>,
+        content: Option<String>,
+    },
+    #[error("Upstream response exceeded {limit} bytes")]
+    UpstreamResponseTooLarge { limit: usize },
     #[error("Fetch timed out")]
     Timeout(String),
     #[error("Not found")]
@@ -67,26 +77,20 @@ pub enum ResolverCreditsError {
     InvalidHeader(String),
     #[error("credit request failed: {0}")]
     Http(reqwest::Error),
+    #[error("credit request returned {status}: {}", compact_body(body))]
+    Backend { status: StatusCode, body: String },
+    #[error("insufficient user credits: {available} available, {required} required")]
+    InsufficientCredits { available: i64, required: i64 },
+    #[error("credit capture was not applied: {0}")]
+    CaptureNotApplied(String),
     #[error("idempotency key was already bound to a different logical request")]
     IdempotencyConflict,
     #[error("idempotency key was already finalized and no durable prior result is available")]
     IdempotencyAlreadyFinalized,
+    #[error("an idempotent debit already exists but no prior resolver result can be replayed")]
+    UnsafeReplay,
     #[error("idempotency binding registry failed: {0}")]
     IdempotencyRegistry(String),
-    #[error("insufficient user credits: balance {balance}, required {required}")]
-    InsufficientCredits { balance: i64, required: i64 },
-    #[error(
-        "untrusted credit debit outcome: mode={mode}, enforced={enforced}, charged={charged}, amount={amount}, expected_amount={expected_amount}"
-    )]
-    UntrustedDebitOutcome {
-        mode: String,
-        enforced: bool,
-        charged: bool,
-        amount: i64,
-        expected_amount: i64,
-    },
-    #[error("credit request returned {status}: {}", compact_body(body))]
-    Backend { status: StatusCode, body: String },
 }
 
 impl ResolverCreditsError {
@@ -103,7 +107,9 @@ impl ResolverCreditsError {
 
     pub fn is_idempotency_conflict(&self) -> bool {
         match self {
-            Self::IdempotencyConflict | Self::IdempotencyAlreadyFinalized => true,
+            Self::IdempotencyConflict | Self::IdempotencyAlreadyFinalized | Self::UnsafeReplay => {
+                true
+            }
             Self::Backend { status, body } => {
                 *status == StatusCode::CONFLICT
                     && backend_error_code(body).as_deref() == Some("idempotency_conflict")
@@ -113,7 +119,7 @@ impl ResolverCreditsError {
     }
 
     pub fn is_idempotency_already_finalized(&self) -> bool {
-        matches!(self, Self::IdempotencyAlreadyFinalized)
+        matches!(self, Self::IdempotencyAlreadyFinalized | Self::UnsafeReplay)
     }
 }
 
@@ -148,10 +154,18 @@ pub enum SnapshotError {
 impl IntoResponse for FetchError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
-            FetchError::UnableFetch(_) | FetchError::Upstream(_) => (
+            FetchError::UnableFetch(_)
+            | FetchError::Upstream(_)
+            | FetchError::UpstreamStatus { .. }
+            | FetchError::UpstreamPayload { .. } => (
                 StatusCode::BAD_GATEWAY,
                 "upstream_fetch_failed",
                 "Upstream fetch failed".to_string(),
+            ),
+            FetchError::UpstreamResponseTooLarge { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_response_too_large",
+                "Upstream response exceeded the configured limit".to_string(),
             ),
             FetchError::UnableToSerialize(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -228,7 +242,11 @@ fn compact_body(body: &str) -> String {
     if body.len() <= 512 {
         return body.to_string();
     }
-    format!("{}...", &body[..512])
+    let end = (0..=512)
+        .rev()
+        .find(|index| body.is_char_boundary(*index))
+        .unwrap_or(0);
+    format!("{}...", &body[..end])
 }
 
 #[cfg(test)]
@@ -247,6 +265,28 @@ mod tests {
         assert_eq!(value["code"], "upstream_fetch_failed");
         assert_eq!(value["error"], "Upstream fetch failed");
         assert!(!String::from_utf8_lossy(&body).contains("secret backend detail"));
+
+        let response = FetchError::UpstreamStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "secret status body".into(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status error body");
+        assert!(!String::from_utf8_lossy(&body).contains("secret status body"));
+    }
+
+    #[tokio::test]
+    async fn oversized_upstream_response_has_a_stable_public_code() {
+        let response = FetchError::UpstreamResponseTooLarge { limit: 64 }.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("limit error body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json error");
+        assert_eq!(value["code"], "upstream_response_too_large");
     }
 
     #[tokio::test]
@@ -270,5 +310,15 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json error");
         assert_eq!(value["code"], "invalid_request");
         assert_eq!(value["error"], "`limit` must be between 1 and 100");
+    }
+
+    #[test]
+    fn compact_body_truncates_multibyte_text_at_a_character_boundary() {
+        let body = format!("{}é-secret", "a".repeat(511));
+        let compacted = compact_body(&body);
+
+        assert_eq!(compacted, format!("{}...", "a".repeat(511)));
+        assert!(compacted.is_char_boundary(compacted.len()));
+        assert!(!compacted.contains("secret"));
     }
 }

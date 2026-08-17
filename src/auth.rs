@@ -265,6 +265,13 @@ impl ResolverAuth {
                 "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_endpoint(introspection_url: String) -> Self {
+        let mut auth = Self::for_tests();
+        auth.introspection_url = introspection_url;
+        auth
+    }
 }
 
 pub async fn oauth_protected_resource_metadata(auth: Arc<ResolverAuth>) -> Json<serde_json::Value> {
