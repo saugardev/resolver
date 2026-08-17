@@ -67,6 +67,90 @@ openapi.fetch("paths").each_value do |path|
 end
 raise "OpenAPI operationId values must be unique" unless operation_ids.uniq.length == operation_ids.length
 
+fetch_responses = openapi.fetch("paths").fetch("/fetch").fetch("post").fetch("responses")
+expected_fetch_responses = {
+  "200" => "#/components/responses/ProductSuccess",
+  "400" => "#/components/responses/BadRequest",
+  "401" => "#/components/responses/Unauthorized",
+  "402" => "#/components/responses/PaymentRequired",
+  "403" => "#/components/responses/Forbidden",
+  "409" => "#/components/responses/Conflict",
+  "413" => "#/components/responses/PayloadTooLarge",
+  "415" => "#/components/responses/UnsupportedMediaType",
+  "500" => "#/components/responses/InternalError",
+  "502" => "#/components/responses/UpstreamFailure",
+  "503" => "#/components/responses/Unavailable",
+  "504" => "#/components/responses/Timeout"
+}
+unless fetch_responses.keys.sort == expected_fetch_responses.keys.sort
+  raise "POST /fetch must document the exact application status policy (no default)"
+end
+expected_fetch_responses.each do |status, reference|
+  unless fetch_responses.fetch(status)["$ref"] == reference
+    raise "POST /fetch response #{status} must reference #{reference}"
+  end
+end
+
+receipt_parameters = openapi
+  .fetch("paths")
+  .fetch("/receipt/{id}")
+  .fetch("get")
+  .fetch("parameters", [])
+receipt_has_idempotency_key = receipt_parameters.any? do |parameter|
+  parameter["$ref"] == "#/components/parameters/IdempotencyKey" ||
+    (parameter["in"] == "header" && parameter["name"].to_s.casecmp("Idempotency-Key").zero?)
+end
+raise "GET /receipt/{id} must not advertise Idempotency-Key" if receipt_has_idempotency_key
+
+expected_mcp_responses = {
+  "401" => "#/components/responses/Unauthorized",
+  "403" => "#/components/responses/McpForbidden",
+  "413" => "#/components/responses/McpPayloadTooLarge",
+  "500" => "#/components/responses/McpInternalError",
+  "503" => "#/components/responses/Unavailable",
+  "504" => "#/components/responses/Timeout",
+  "default" => "#/components/responses/McpTransportResponse"
+}
+%w[/ /mcp].each do |path|
+  responses = openapi.fetch("paths").fetch(path).fetch("post").fetch("responses")
+  unless responses.key?("200") && (expected_mcp_responses.keys - responses.keys).empty?
+    raise "POST #{path} must cover the audited MCP HTTP response policy"
+  end
+  expected_mcp_responses.each do |status, reference|
+    unless responses.fetch(status)["$ref"] == reference
+      raise "POST #{path} response #{status} must reference #{reference}"
+    end
+  end
+end
+
+%w[McpForbidden McpInternalError McpTransportResponse].each do |name|
+  response = openapi.fetch("components").fetch("responses").fetch(name)
+  raise "#{name} must not assert one response body shape" if response.key?("content")
+end
+mcp_payload_content = openapi
+  .fetch("components")
+  .fetch("responses")
+  .fetch("McpPayloadTooLarge")
+  .fetch("content")
+raise "MCP 413 must document its plain-text middleware body" unless mcp_payload_content.keys == ["text/plain"]
+
+http_methods = %w[get post put patch delete options head trace]
+global_security = openapi.fetch("security", [])
+openapi.fetch("paths").each do |path, path_item|
+  path_item.each do |method, operation|
+    next unless http_methods.include?(method) && operation.is_a?(Hash)
+
+    security = operation.fetch("security", global_security)
+    next if security.nil? || security.empty?
+
+    responses = operation.fetch("responses")
+    next if responses.key?("default")
+    next if path == "/fetch" && method == "post"
+
+    raise "authenticated operation #{method.upcase} #{path} needs a safe default response"
+  end
+end
+
 mcp = JSON.parse(File.read(File.join(root, "docs/mcp-client.example.json")))
 resolver = mcp.fetch("mcpServers").fetch("livy-resolver")
 raise "MCP example must use Streamable HTTP" unless resolver["type"] == "http"

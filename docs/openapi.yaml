@@ -104,8 +104,16 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "402":
           $ref: "#/components/responses/PaymentRequired"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/InternalError"
         "502":
           $ref: "#/components/responses/UpstreamFailure"
         "503":
@@ -253,7 +261,6 @@ paths:
           schema:
             type: string
             pattern: "^[A-Za-z0-9_-]{1,128}$"
-        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: Tenant-owned receipt
@@ -286,6 +293,18 @@ paths:
                 type: object
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/McpForbidden"
+        "413":
+          $ref: "#/components/responses/McpPayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/McpInternalError"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        default:
+          $ref: "#/components/responses/McpTransportResponse"
   /mcp:
     post:
       operationId: streamableHttpMcp
@@ -309,6 +328,18 @@ paths:
                 type: object
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/McpForbidden"
+        "413":
+          $ref: "#/components/responses/McpPayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/McpInternalError"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        default:
+          $ref: "#/components/responses/McpTransportResponse"
 components:
   securitySchemes:
     bearerAuth:
@@ -384,8 +415,36 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The authenticated token lacks the required route scope
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     PaymentRequired:
       description: Insufficient credits
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body exceeds the configured product-body limit
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: Product request Content-Type is not application/json
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Resolver serialization, configuration, or internal operation failed
       content:
         application/json:
           schema:
@@ -420,6 +479,24 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    McpForbidden:
+      description: |
+        OAuth scope, Host, or Origin policy rejected the request. Depending on
+        which MCP boundary rejected it, the response can be JSON or plain text.
+    McpPayloadTooLarge:
+      description: MCP compatibility processing rejected an oversized request body
+      content:
+        text/plain:
+          schema:
+            type: string
+    McpInternalError:
+      description: |
+        MCP transport or connector-compatibility processing failed. The response
+        can be JSON or plain text, so no single body schema is asserted.
+    McpTransportResponse:
+      description: |
+        Another MCP Streamable HTTP transport response. Status, media type, and
+        body shape are transport-dependent; no JSON error schema is asserted.
   schemas:
     ProductRequest:
       type: object
