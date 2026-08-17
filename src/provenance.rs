@@ -1415,6 +1415,7 @@ mod tests {
     fn request_consent_and_auth_are_both_required_for_publication() {
         let authenticated = ResolverAuthContext {
             access_token: Some("token".to_string()),
+            subject: Some("user-a".to_string()),
             client_id: Some("client".to_string()),
             scopes: vec![],
             audiences: vec![],

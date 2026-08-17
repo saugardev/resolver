@@ -73,6 +73,16 @@ pub enum ResolverCreditsError {
     IdempotencyRegistry(String),
     #[error("insufficient user credits: balance {balance}, required {required}")]
     InsufficientCredits { balance: i64, required: i64 },
+    #[error(
+        "untrusted credit debit outcome: mode={mode}, enforced={enforced}, charged={charged}, amount={amount}, expected_amount={expected_amount}"
+    )]
+    UntrustedDebitOutcome {
+        mode: String,
+        enforced: bool,
+        charged: bool,
+        amount: i64,
+        expected_amount: i64,
+    },
     #[error("credit request returned {status}: {}", compact_body(body))]
     Backend { status: StatusCode, body: String },
 }

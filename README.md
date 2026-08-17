@@ -183,8 +183,9 @@ Prefer `/fetch` with `mode` over the compat routes.
 
 Send one validated `Idempotency-Key` header on product requests and reuse it
 only when retrying the same logical request. The resolver scopes and hashes the
-key with the authenticated tenant, project, client, and route before sending it
-to the credit service. The backend key is bound to a canonical fingerprint of
+key with the authenticated OAuth subject, tenant, project, client, and route
+before sending it to the credit service. OAuth introspection must therefore
+return a non-empty `sub`. The backend key is bound to a canonical fingerprint of
 the complete validated execution plan, caller key, authenticated scope,
 effective amount, and pricing version. Reusing a caller key for a different
 request returns HTTP 409 within a replica; across replicas the different
@@ -214,7 +215,11 @@ so every environment refuses it unless
 `LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS=true` explicitly acknowledges a
 single-replica exception. This repository does not claim or ship a durable
 implementation; applications can inject an async shared durable `ReceiptStore`
-through `ReceiptStoreFactory`.
+through `ReceiptStoreFactory`. The library exports
+`build_app_with_receipt_store_factory` and `run_with_receipt_store_factory` so
+an application can supply that factory without using the default environment
+factory. Factory creation and store health checks are async; startup and
+`/readyz` fail closed when the supplied store is unavailable.
 
 ## API security
 

@@ -104,17 +104,22 @@ pub trait ReceiptStore: Send + Sync {
 
     /// Whether records survive restarts and are shared by every service replica.
     fn is_shared_durable(&self) -> bool;
+
+    /// Verify that the backing store can currently serve reads and writes.
+    async fn health_check(&self) -> Result<(), ReceiptStoreError>;
 }
 
+#[async_trait]
 pub trait ReceiptStoreFactory: Send + Sync {
-    fn create(&self) -> Result<std::sync::Arc<dyn ReceiptStore>, ReceiptStoreError>;
+    async fn create(&self) -> Result<std::sync::Arc<dyn ReceiptStore>, ReceiptStoreError>;
 }
 
 #[derive(Debug, Default)]
 pub struct EnvironmentReceiptStoreFactory;
 
+#[async_trait]
 impl ReceiptStoreFactory for EnvironmentReceiptStoreFactory {
-    fn create(&self) -> Result<std::sync::Arc<dyn ReceiptStore>, ReceiptStoreError> {
+    async fn create(&self) -> Result<std::sync::Arc<dyn ReceiptStore>, ReceiptStoreError> {
         let backend =
             optional_env("LIVY_RESOLVER_RECEIPT_STORE").unwrap_or_else(|| "memory".to_string());
         match backend.as_str() {
@@ -219,6 +224,13 @@ impl ReceiptStore for InMemoryReceiptStore {
 
     fn is_shared_durable(&self) -> bool {
         false
+    }
+
+    async fn health_check(&self) -> Result<(), ReceiptStoreError> {
+        self.records
+            .lock()
+            .map(|_| ())
+            .map_err(|_| ReceiptStoreError::LockUnavailable)
     }
 }
 
@@ -347,6 +359,7 @@ mod tests {
     fn authenticated_receipt_owner_requires_both_scope_claims() {
         let context = ResolverAuthContext {
             access_token: Some("token".to_string()),
+            subject: Some("user-a".to_string()),
             client_id: Some("client".to_string()),
             scopes: vec![],
             audiences: vec![],

@@ -45,17 +45,18 @@ pub struct PendingSnapshot {
 }
 
 impl Fetcher {
-    pub fn from_receipt_store_factory(
+    pub async fn from_receipt_store_factory(
         factory: &dyn ReceiptStoreFactory,
     ) -> Result<Self, FetchError> {
         dotenvy::dotenv().ok();
         let receipts = factory
             .create()
+            .await
             .map_err(|err| FetchError::Http(err.to_string()))?;
-        Self::with_receipt_store(receipts)
+        Self::with_receipt_store(receipts).await
     }
 
-    pub fn with_receipt_store(receipts: Arc<dyn ReceiptStore>) -> Result<Self, FetchError> {
+    pub async fn with_receipt_store(receipts: Arc<dyn ReceiptStore>) -> Result<Self, FetchError> {
         dotenvy::dotenv().ok();
         let explicit_memory_exception = env_bool("LIVY_RESOLVER_ALLOW_IN_MEMORY_RECEIPTS", false)
             .map_err(|err| FetchError::Http(err.to_string()))?;
@@ -65,6 +66,10 @@ impl Fetcher {
                     .to_string(),
             ));
         }
+        receipts
+            .health_check()
+            .await
+            .map_err(|err| FetchError::Http(format!("receipt store health check failed: {err}")))?;
         let key = std::env::var("LIVY_RESOLVER_KEY")
             .or_else(|_| std::env::var("SPIDER_API_KEY"))
             .or_else(|_| std::env::var("SPIDER_KEY"))

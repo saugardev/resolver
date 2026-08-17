@@ -159,7 +159,11 @@ struct ResolverCreditLedgerEntry {
 
 impl ResolverCreditDebitOutcome {
     pub fn permits_work(&self) -> bool {
-        self.enforced || self.mode == "idempotent_replay"
+        self.enforced || (self.mode == "idempotent_replay" && !self.charged)
+    }
+
+    fn is_trusted_for(&self, expected_amount: i64) -> bool {
+        self.amount == expected_amount && self.permits_work()
     }
 }
 
@@ -240,6 +244,11 @@ impl ResolverCreditsClient {
             .access_token
             .as_deref()
             .ok_or(ResolverCreditsError::MissingAuth("access_token"))?;
+        auth_context
+            .subject
+            .as_deref()
+            .filter(|subject| !subject.trim().is_empty())
+            .ok_or(ResolverCreditsError::MissingAuth("subject"))?;
         let tenant_id = auth_context
             .tenant_id
             .as_deref()
@@ -353,6 +362,15 @@ impl ResolverCreditsClient {
             .json::<ResolverCreditDebitOutcome>()
             .await
             .map_err(ResolverCreditsError::Http)?;
+        if !outcome.is_trusted_for(authorization.amount) {
+            return Err(ResolverCreditsError::UntrustedDebitOutcome {
+                mode: outcome.mode,
+                enforced: outcome.enforced,
+                charged: outcome.charged,
+                amount: outcome.amount,
+                expected_amount: authorization.amount,
+            });
+        }
         if let Some(caller_scope) = authorization.caller_scope.as_deref() {
             self.idempotency_bindings
                 .mark_captured(caller_scope, &authorization.request_fingerprint)?;
@@ -490,6 +508,7 @@ fn resolver_request_fingerprint(
         "tenant_id": auth_context.tenant_id.as_deref(),
         "project_id": auth_context.project_id.as_deref(),
         "client_id": auth_context.client_id.as_deref(),
+        "subject": auth_context.subject.as_deref(),
         "reason": request.reason,
         "route": request.route,
         "amount": amount,
@@ -513,6 +532,7 @@ fn caller_idempotency_scope(
         "tenant_id": auth_context.tenant_id.as_deref(),
         "project_id": auth_context.project_id.as_deref(),
         "client_id": auth_context.client_id.as_deref(),
+        "subject": auth_context.subject.as_deref(),
         "caller_idempotency_key": requested_idempotency_key,
     });
     let canonical = canonical_json_bytes(&material)?;
@@ -651,11 +671,15 @@ mod tests {
         Json, Router, extract::Path, http::HeaderMap as AxumHeaderMap, routing::get, routing::post,
     };
     use reqwest::StatusCode;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn auth() -> ResolverAuthContext {
         ResolverAuthContext {
             access_token: Some("token".to_string()),
+            subject: Some("user-a".to_string()),
             client_id: Some("client".to_string()),
             scopes: vec!["tool:fetch_source".to_string()],
             audiences: Vec::new(),
@@ -737,6 +761,13 @@ mod tests {
         assert_ne!(
             first,
             resolver_request_fingerprint(&request, &changed_auth, 7).unwrap()
+        );
+
+        let mut changed_subject = auth();
+        changed_subject.subject = Some("user-b".to_string());
+        assert_ne!(
+            first,
+            resolver_request_fingerprint(&request, &changed_subject, 7).unwrap()
         );
     }
 
@@ -840,6 +871,7 @@ mod tests {
         };
         let auth = ResolverAuthContext {
             access_token: Some("oauth-token".to_string()),
+            subject: Some("user-a".to_string()),
             client_id: Some("client-a".to_string()),
             scopes: vec!["resolver:source:fetch".to_string()],
             audiences: vec!["resolver".to_string()],
@@ -909,6 +941,165 @@ mod tests {
             request["body"]["metadata"]["caller_idempotency_key_sha256"],
             sha256_hex(b"retry-1")
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unenforced_success_does_not_mark_binding_captured_for_retry() {
+        let balance_checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_handler = balance_checks.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credits",
+                get(move || {
+                    let checks = checks_for_handler.clone();
+                    async move {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"balance": 10}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credits/debits",
+                post(|| async {
+                    Json(json!({
+                        "mode": "shadow",
+                        "enforced": false,
+                        "charged": true,
+                        "amount": 1,
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ResolverCreditsClient {
+            enabled: true,
+            backend_base_url: format!("http://{address}"),
+            amount: 1,
+            http: reqwest::Client::new(),
+            idempotency_bindings: IdempotencyBindingRegistry::default(),
+        };
+        let auth = auth();
+        let logical_request = json!({"source": "https://example.com"});
+
+        let authorization = client
+            .preflight_product_request(
+                &auth,
+                "retry_regression",
+                Some("https://example.com"),
+                None,
+                &logical_request,
+                Some("same-key"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.capture_authorized_request(authorization).await,
+            Err(ResolverCreditsError::UntrustedDebitOutcome { .. })
+        ));
+
+        client
+            .preflight_product_request(
+                &auth,
+                "retry_regression",
+                Some("https://example.com"),
+                None,
+                &logical_request,
+                Some("same-key"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance_checks.load(Ordering::SeqCst), 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn captured_binding_is_never_shared_between_oauth_subjects() {
+        let user_b_balance_checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_handler = user_b_balance_checks.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credits",
+                get(move |headers: AxumHeaderMap| {
+                    let checks = checks_for_handler.clone();
+                    async move {
+                        let user_b = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer token-b");
+                        if user_b {
+                            checks.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"balance": 0}))
+                        } else {
+                            Json(json!({"balance": 10}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credit-ledger",
+                get(|| async { Json(json!([])) }),
+            )
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credits/debits",
+                post(|| async {
+                    Json(json!({
+                        "mode": "enforce",
+                        "enforced": true,
+                        "charged": true,
+                        "amount": 1,
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ResolverCreditsClient {
+            enabled: true,
+            backend_base_url: format!("http://{address}"),
+            amount: 1,
+            http: reqwest::Client::new(),
+            idempotency_bindings: IdempotencyBindingRegistry::default(),
+        };
+        let auth_a = auth();
+        let mut auth_b = auth_a.clone();
+        auth_b.access_token = Some("token-b".to_string());
+        auth_b.subject = Some("user-b".to_string());
+        let logical_request = json!({"source": "https://example.com"});
+
+        let user_a_authorization = client
+            .preflight_product_request(
+                &auth_a,
+                "subject_regression",
+                Some("https://example.com"),
+                None,
+                &logical_request,
+                Some("same-key"),
+            )
+            .await
+            .unwrap();
+        client
+            .capture_authorized_request(user_a_authorization)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .preflight_product_request(
+                    &auth_b,
+                    "subject_regression",
+                    Some("https://example.com"),
+                    None,
+                    &logical_request,
+                    Some("same-key"),
+                )
+                .await,
+            Err(ResolverCreditsError::InsufficientCredits { .. })
+        ));
+        assert_eq!(user_b_balance_checks.load(Ordering::SeqCst), 1);
 
         server.abort();
     }

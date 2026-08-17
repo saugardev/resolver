@@ -136,7 +136,10 @@ such as `https://resolver.api.livylabs.xyz/mcp`, because Claude matches the
 registered connector URL exactly during OAuth discovery.
 Set `LIVY_RESOLVER_AUTH_ENABLED=false` only for local unauthenticated
 development, and also set `LIVY_RESOLVER_CREDITS_ENABLED=false`; enabled credit
-enforcement fails closed without an authenticated access token.
+enforcement fails closed without an authenticated access token. Authenticated
+credit enforcement also requires a non-empty introspection `sub`; caller
+idempotency is isolated by that OAuth subject as well as tenant, project,
+client, and request fingerprint.
 
 Use `fetch_source` when the user gives an exact URL as the required
 source:
