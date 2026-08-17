@@ -42,22 +42,22 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-rg -q '"status":"alive"' "$smoke_root/health.json"
+grep -qF '"status":"alive"' "$smoke_root/health.json"
 
 ready_status="$(curl --silent --output "$smoke_root/ready.json" --write-out '%{http_code}' "$base_url/readyz")"
 test "$ready_status" = "503"
-rg -q '"status":"not_ready"' "$smoke_root/ready.json"
+grep -qF '"status":"not_ready"' "$smoke_root/ready.json"
 
 invalid_status="$(curl --silent --output "$smoke_root/invalid.json" --write-out '%{http_code}' \
   -H 'content-type: application/json' \
   --data '{"source":"https://example.com","unknown_contract_field":true}' \
   "$base_url/fetch")"
 test "$invalid_status" = "400"
-rg -q '"code":"invalid_json"' "$smoke_root/invalid.json"
+grep -qF '"code":"invalid_json"' "$smoke_root/invalid.json"
 
 curl --fail --silent --show-error "$base_url/metrics" >"$smoke_root/metrics.txt"
-rg -q '^livy_resolver_http_requests_total [3-9][0-9]*$' "$smoke_root/metrics.txt"
-rg -q '^livy_resolver_http_requests_in_flight 1$' "$smoke_root/metrics.txt"
+grep -Eq '^livy_resolver_http_requests_total [3-9][0-9]*$' "$smoke_root/metrics.txt"
+grep -Eq '^livy_resolver_http_requests_in_flight 1$' "$smoke_root/metrics.txt"
 
 kill -TERM "$server_pid"
 wait "$server_pid"

@@ -13,7 +13,7 @@ trap cleanup EXIT
 
 git -C "$repo_root" archive --format=tar HEAD | tar -xf - -C "$fresh_checkout"
 
-if rg -n '(\.\./livy-core|git\s*=|livy-provenance-sdk)' "$fresh_checkout/Cargo.toml"; then
+if grep -En '(\.\./livy-core|git[[:space:]]*=|livy-provenance-sdk)' "$fresh_checkout/Cargo.toml"; then
   echo "fresh checkout contains an external path or git dependency" >&2
   exit 1
 fi

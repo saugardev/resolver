@@ -55,6 +55,10 @@ jobs:
           ruby scripts/validate-contracts.rb
           bash -n scripts/container-smoke.sh scripts/smoke.sh scripts/verify-fresh-checkout.sh
           shellcheck scripts/container-smoke.sh scripts/smoke.sh scripts/verify-fresh-checkout.sh
+          if grep -REn '(^|[[:space:]])rg([[:space:]]|$)' scripts; then
+            echo "CI scripts must not depend on undeclared ripgrep" >&2
+            exit 1
+          fi
 
       - name: Install pinned audit tools
         run: |
