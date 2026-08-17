@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Livy Resolver full audit — 2026-08-17</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #15202b;
+      --muted: #5f6b76;
+      --line: #d9e0e6;
+      --panel: #f7f9fb;
+      --critical: #9f1239;
+      --critical-bg: #fff1f2;
+      --high: #b45309;
+      --high-bg: #fff7ed;
+      --medium: #1d4ed8;
+      --medium-bg: #eff6ff;
+      --low: #475569;
+      --low-bg: #f1f5f9;
+      --good: #166534;
+      --good-bg: #f0fdf4;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: #fff;
+    }
+    main { width: min(1120px, calc(100% - 32px)); margin: 36px auto 72px; }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { margin: 0 0 8px; font-size: clamp(30px, 5vw, 50px); letter-spacing: -0.03em; }
+    h2 { margin: 42px 0 16px; font-size: 25px; }
+    h3 { margin: 0; font-size: 18px; }
+    p { margin: 8px 0 14px; }
+    a { color: #075985; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { font-size: .92em; }
+    pre {
+      overflow-x: auto;
+      margin: 12px 0 0;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-size: 12.5px;
+      line-height: 1.45;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--panel); }
+    .lede { max-width: 850px; color: var(--muted); font-size: 18px; }
+    .status {
+      display: inline-flex;
+      margin-top: 14px;
+      padding: 8px 12px;
+      border: 1px solid #fecdd3;
+      border-radius: 999px;
+      color: var(--critical);
+      background: var(--critical-bg);
+      font-weight: 750;
+    }
+    .meta { margin-top: 12px; color: var(--muted); }
+    .scores { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 24px 0; }
+    .score { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .score strong { display: block; font-size: 28px; }
+    .score span { color: var(--muted); }
+    .summary { padding: 18px 20px; border-left: 5px solid var(--critical); background: var(--critical-bg); }
+    .summary ul, .checklist { margin: 10px 0 0; padding-left: 22px; }
+    .finding { margin: 16px 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+    .finding > header { display: flex; gap: 12px; align-items: flex-start; padding: 16px 18px; background: var(--panel); }
+    .finding .body { padding: 4px 18px 18px; }
+    .badge { flex: none; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
+    .critical .badge { color: var(--critical); background: var(--critical-bg); }
+    .high .badge { color: var(--high); background: var(--high-bg); }
+    .medium .badge { color: var(--medium); background: var(--medium-bg); }
+    .low .badge { color: var(--low); background: var(--low-bg); }
+    .evidence { color: var(--muted); }
+    .result-pass { color: var(--good); font-weight: 700; }
+    .result-fail { color: var(--critical); font-weight: 700; }
+    .priority { padding: 18px; border: 1px solid var(--line); border-radius: 10px; }
+    .priority ol { margin: 8px 0 0; padding-left: 24px; }
+    .note { color: var(--muted); font-size: 13px; }
+    @media print {
+      main { width: 100%; margin: 0; }
+      .finding { break-inside: avoid; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Livy Resolver full audit</h1>
+    <p class="lede">Repository-wide review of security, tenancy, billing correctness, MCP behavior, upstream handling, test coverage, dependencies, packaging, documentation, and production operations.</p>
+    <div class="status">Not ready for production</div>
+    <p class="meta">Commit <code>62551eb</code> · branch <code>saugardev/full-audit-missing-check</code> · audited 2026-08-17 · 6,588 lines reviewed</p>
+  </header>
+
+  <section class="scores" aria-label="Audit scores">
+    <div class="score"><strong>D</strong><span>Overall</span></div>
+    <div class="score"><strong>D</strong><span>Security</span></div>
+    <div class="score"><strong>C</strong><span>Correctness</span></div>
+    <div class="score"><strong>C</strong><span>Error handling</span></div>
+    <div class="score"><strong>C</strong><span>Testing</span></div>
+    <div class="score"><strong>B</strong><span>Organization &amp; docs</span></div>
+  </section>
+
+  <section class="summary">
+    <h2 style="margin-top:0">Executive decision</h2>
+    <p>The service has a solid module layout, bounded request bodies, route-level OAuth scopes, sanitized public errors, safe URL logging, and 39 passing unit tests. Those strengths are outweighed by two release-blocking security defects and several boundary failures.</p>
+    <ul>
+      <li>Provenance may turn on implicitly and defaults toward irreversible public publication of URLs and response data.</li>
+      <li>Receipt reads have no tenant/project ownership check; IDs are predictable and storage is unbounded and process-local.</li>
+      <li>A reproduced Spider HTTP 500 is billed and returned as HTTP 200 with a new receipt.</li>
+      <li>The current checkout cannot build from a clean clone because a required sibling path dependency is missing.</li>
+    </ul>
+  </section>
+
+  <h2>Verification matrix</h2>
+  <table>
+    <thead><tr><th>Check</th><th>Result</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td><code>cargo fmt --all -- --check</code></td><td class="result-pass">Pass</td><td>No formatting diff.</td></tr>
+      <tr><td>Clean-checkout <code>cargo check/test/clippy</code></td><td class="result-fail">Blocked</td><td><code>../livy-core/packages/provenance-sdk</code> is absent.</td></tr>
+      <tr><td>Isolated exact-commit build beside existing <code>livy-core</code></td><td class="result-pass">Pass with 1 warning</td><td>Source compiles; unused <code>StatusCode</code> import remains.</td></tr>
+      <tr><td><code>cargo test --all-targets --all-features</code></td><td class="result-pass">39/39 pass</td><td>All are in-module unit tests; no service-boundary tests.</td></tr>
+      <tr><td>Strict Clippy (<code>-D warnings</code>)</td><td class="result-fail">Fail</td><td>7 diagnostics across 6 lint classes: unused import, constant assertion, two lazy-evaluation diagnostics, collapsible <code>if</code>, too many arguments, and derivable <code>Default</code>.</td></tr>
+      <tr><td><code>cargo audit</code></td><td class="result-fail">Fail</td><td><code>quinn-proto 0.11.14</code> RUSTSEC-2026-0185 and <code>anyhow 1.0.102</code> RUSTSEC-2026-0190. Neither appears in the active target graph, but the lockfile remains audit-red.</td></tr>
+      <tr><td>Gitleaks, all Git history</td><td class="result-pass">Pass</td><td>33 commits, no leaked secret detected.</td></tr>
+      <tr><td><code>cargo machete</code></td><td class="result-pass">Pass</td><td>No unused direct dependency detected.</td></tr>
+      <tr><td>Local HTTP smoke test</td><td class="result-pass">Pass</td><td>Health, metadata, structured errors, request IDs, and security headers behaved as documented.</td></tr>
+      <tr><td>Mock Spider HTTP 500</td><td class="result-fail">Fail</td><td>Resolver returned HTTP 200, created a receipt, and exposed <code>{"message":"upstream unavailable"}</code> as successful data.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Detailed findings</h2>
+
+  <article class="finding critical">
+    <header><span class="badge">Critical C-01</span><h3>Optional provenance can activate implicitly and publish sensitive resolver data by default</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Merely setting the backend URL used by credits can enable provenance. With the remaining defaults, visibility is public, managed publication is on, the full source URL is a public schema field, and upstream JSON up to 256 KiB can be sent to irreversible publication. Query-string secrets, authenticated-page content, returned headers, and returned cookies are therefore at risk.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/provenance.rs:164-188, 589, 673-723, 936-943</code>. Reproduction with only <code>LIVY_BACKEND_BASE_URL</code> set caused startup to panic for missing <code>ITA_API_KEY</code>, proving the implicit activation path. With valid attestation credentials it proceeds toward publication.</p>
+      <p><strong>Fix.</strong> Require explicit opt-in and make every publication choice fail-closed. Hash or redact source query strings and require per-request consent before revealing an artifact.</p>
+      <pre>let enabled = env_bool("LIVY_PROVENANCE_ENABLED")?.unwrap_or(false);
+let visibility = env_or("LIVY_PROVENANCE_VISIBILITY", "private");
+let managed_publication = env_bool("LIVY_PROVENANCE_MANAGED_PUBLICATION")?
+    .unwrap_or(false);
+let publish_response_artifact = env_bool(
+    "LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT"
+)?.unwrap_or(false);
+
+// Public schema field should be a redacted URL or commitment, not the raw URL.
+schema_field(4, "source_sha256", Json, json!(sha256(source)), true);</pre>
+    </div>
+  </article>
+
+  <article class="finding critical">
+    <header><span class="badge">Critical C-02</span><h3>Receipt storage is cross-tenant, predictable, unbounded, volatile, and not replica-safe</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Any token with <code>resolver:receipt:read</code> can read any receipt if it knows or guesses the ID. IDs are timestamp-plus-counter values, records include the source URL, and lookup checks only the ID. The map has no TTL or capacity, disappears on restart, and produces random 404s behind multiple replicas.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/api.rs:217-228</code>; <code>src/fetch.rs:28-29, 663-725</code>.</p>
+      <p><strong>Fix.</strong> Store ownership at creation and query by the authenticated tenant/project. Use a durable bounded store, cryptographically strong identifiers, expiry, and explicit deletion.</p>
+      <pre>struct ReceiptRecord {
+    id: Uuid,
+    tenant_id: String,
+    project_id: String,
+    expires_at: DateTime&lt;Utc&gt;,
+    receipt: Receipt,
+}
+
+store.get_receipt(
+    auth.tenant_id.as_deref().ok_or(Unauthorized)?,
+    auth.project_id.as_deref().ok_or(Unauthorized)?,
+    id,
+).await?</pre>
+    </div>
+  </article>
+
+  <article class="finding high">
+    <header><span class="badge">High H-01</span><h3>Spider non-success HTTP responses are accepted as successful, billable resolver results</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> The upstream client preserves most non-2xx responses as normal JSON values. The resolver only checks <code>status</code>/<code>error</code> on the first array item. Object-shaped errors therefore create receipts and provenance and return HTTP 200 after the credit debit.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/fetch.rs:73-107, 642-660</code>. A local mock returning Spider HTTP 500 reproduced resolver HTTP 200 with a new receipt.</p>
+      <p><strong>Fix.</strong> Patch or upgrade <code>spider-client</code> so every non-success response goes through <code>error_for_status()</code>. Keep a defensive payload check and test that failures produce 502, no receipt, and no provenance. Decide and document whether failed attempts are charged or refunded.</p>
+      <pre>let response = client.send().await?;
+let response = response.error_for_status()?;
+let data = parse_response(response).await?;
+
+#[tokio::test]
+async fn spider_500_maps_to_502_without_receipt_or_provenance() { /* mock server */ }</pre>
+    </div>
+  </article>
+
+  <article class="finding high">
+    <header><span class="badge">High H-02</span><h3>MCP DNS-rebinding protection is explicitly disabled</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> RMCP's allowed-host check exists to protect local servers from DNS rebinding and warns against disabling it for public deployments. This service clears the list. Risk is highest in the documented local mode where OAuth is disabled.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/main.rs:130-132</code>.</p>
+      <p><strong>Fix.</strong> Configure explicit local and production hostnames; do not use an empty allow-list. Add tests for accepted and attacker-controlled <code>Host</code> values.</p>
+      <pre>StreamableHttpServerConfig::default().with_allowed_hosts([
+    "localhost",
+    "127.0.0.1",
+    "resolver.api.livylabs.xyz",
+])</pre>
+    </div>
+  </article>
+
+  <article class="finding high">
+    <header><span class="badge">High H-03</span><h3>Private, loopback, link-local, and cloud-metadata destinations are allowed without an enforced egress policy</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> The resolver is an authenticated SSRF primitive by design. The repository contains no gateway or network policy to enforce the README's requirement to block metadata and other sensitive destinations. Redirects and DNS rebinding at the fetched destination also need enforcement.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/types.rs:352-377</code> and the explicit private-address unit test; <code>README.md:174-178</code>.</p>
+      <p><strong>Fix.</strong> Split public-source and internal-source capabilities. Default-deny loopback, private, link-local, multicast, and metadata IP ranges after every DNS resolution and redirect. Put internal resolution behind a separate scope and deployment with an explicit allow-list and egress firewall.</p>
+      <pre>enum SourcePolicy { PublicInternet, InternalAllowlist }
+
+validate_resolved_ips(&amp;url, SourcePolicy::PublicInternet)?;
+// Reject 127/8, ::1, RFC1918, 169.254/16, fc00::/7, metadata hostnames, etc.
+// Re-run the check for each redirect target.</pre>
+    </div>
+  </article>
+
+  <article class="finding high">
+    <header><span class="badge">High H-04</span><h3>Availability bounds stop at request bodies; responses, provenance calls, and MCP sessions remain unbounded</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Spider JSON/text is fully buffered without a maximum, then cloned for fallback/provenance and serialized again. The provenance HTTP client has no timeout on MCP calls. RMCP's default local session manager has no repository-configured session cap or idle expiry. These paths permit memory growth and hung requests even though product request bodies and product duration are bounded.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/provenance.rs:238</code>; <code>src/mcp.rs:278-283, 307-320</code>; <code>src/main.rs:55</code>. Receipt growth is also covered by C-02.</p>
+      <p><strong>Fix.</strong> Stream and cap upstream bodies before JSON parsing, avoid whole-response clones, set connect/request timeouts on every client, and use a session manager with maximum sessions plus idle eviction (or stateless MCP if compatible).</p>
+      <pre>const MAX_UPSTREAM_BYTES: usize = 8 * 1024 * 1024;
+let http = reqwest::Client::builder()
+    .connect_timeout(Duration::from_secs(5))
+    .timeout(Duration::from_secs(20))
+    .build()?;
+
+let bytes = read_stream_bounded(response.bytes_stream(), MAX_UPSTREAM_BYTES).await?;</pre>
+    </div>
+  </article>
+
+  <article class="finding high">
+    <header><span class="badge">High H-05</span><h3>The repository is not reproducibly buildable and has no CI safety net</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> A clean clone cannot check, test, lint, or build because <code>Cargo.toml</code> points outside the repository. No workflow clones the companion project or runs quality/security gates.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>Cargo.toml:16</code>. All three commands fail in this checkout with missing <code>../livy-core/packages/provenance-sdk/Cargo.toml</code>. There is no <code>.github/workflows</code> directory.</p>
+      <p><strong>Fix.</strong> Publish the SDK, pin a Git revision, add it as a declared submodule, or make both projects a documented workspace. Add CI on the minimum supported and stable Rust versions.</p>
+      <pre>livy-provenance-sdk = {
+  git = "https://github.com/livylabs/livy-core",
+  rev = "&lt;immutable-commit&gt;"
+}
+
+# CI gates
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo audit --deny warnings</pre>
+    </div>
+  </article>
+
+  <article class="finding high">
+    <header><span class="badge">High H-06</span><h3>Tests cover helpers, not security and billing boundaries</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> All 39 tests pass while the false-success, cross-tenant receipt, implicit provenance, disabled-host, double-introspection, and billing-idempotency defects remain. There are no integration, end-to-end, concurrency, or property tests.</p>
+      <p class="evidence"><strong>Evidence.</strong> Tests live only inside <code>src/*.rs</code>; no <code>tests/</code> directory exists.</p>
+      <p><strong>Fix.</strong> Extract a library/router constructor and inject mock auth, credits, Spider, receipt store, and provenance clients. Add boundary suites before refactoring behavior.</p>
+      <pre>tests/
+  auth_scope_matrix.rs
+  tenant_receipts.rs
+  upstream_status_mapping.rs
+  credit_idempotency.rs
+  provenance_disclosure.rs
+  limits_and_timeouts.rs
+  mcp_host_and_session.rs</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-01</span><h3>Compatibility and snapshot routes lose OAuth-scoped provenance context</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> <code>/fetchfast</code> and <code>/fetchunblock</code> debit the authenticated tenant, then call fetch methods with no auth context. Provenance falls back to a legacy service key, fails in production, or is recorded outside the user's tenant/project. <code>/snapshot</code> neither stores a resolver receipt nor records provenance despite its name and the broad README claim.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/api.rs:198-266</code>; <code>src/fetch.rs:145-150, 201-219, 222-238</code>.</p>
+      <p><strong>Fix.</strong> Route every endpoint through one authenticated execution pipeline; pass <code>Some(&amp;auth_context)</code> to provenance and store the same tenant-owned receipt shape. Deprecate duplicate compatibility paths after migration.</p>
+      <pre>fetcher
+  .get_fast_data_with_receipt_with_auth(&amp;payload.source, Some(&amp;auth_context))
+  .await?;
+
+// Implement snapshot through product_fetch_with_auth rather than a parallel path.</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-02</span><h3>Product billing has no retry idempotency and does not enforce the debit outcome</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> MCP accepts an idempotency key, but every product retry creates a new nonce-based key and can charge again. Successful debit responses proceed even when <code>enforced</code> is false. Receipt reads, crawl, screenshots, and simple fetches all use the same configurable amount, and failed-upstream billing policy is undocumented.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/credits.rs:71-92, 185-217</code>; <code>src/api.rs:270-315</code>.</p>
+      <p><strong>Fix.</strong> Accept and validate <code>Idempotency-Key</code> on product mutations, scope it to tenant/project/route, distinguish replay from skipped enforcement, define route pricing, and document/refund failed-upstream behavior.</p>
+      <pre>let key = ProductIdempotencyKey {
+    tenant_id, project_id, route, caller_key: header_value,
+};
+let outcome = credits.debit_product_request(..., Some(key)).await?;
+ensure!(outcome.enforced || outcome.mode == "idempotent_replay", CreditsDisabled);</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-03</span><h3>“Adaptive fallback” does not rescue the current request</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Challenge-page detection is spawned after a successful fast result, so the user receives the challenge page; only a later request uses unblock. Error detection receives <code>FetchError::to_string()</code>, whose public display discards the upstream detail, so many error-triggered fallbacks can never be classified.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/mcp.rs:243-305, 811-847</code>; sanitized error displays in <code>src/errors.rs:12-34</code>.</p>
+      <p><strong>Fix.</strong> Inspect the fast result synchronously and perform one bounded unblock retry in the same tool call under the original debit/idempotency key. Keep structured private error kinds for routing without returning or logging sensitive text.</p>
+      <pre>let fast = fetch_fast().await;
+let reason = classify_structured(&amp;fast);
+let result = match reason {
+    Some(reason) => fetch_unblock_once(reason).await?,
+    None => fast?,
+};</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-04</span><h3>Mode routing and proxy parameters contradict the public contract</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> <code>/fetch</code> accepts crawl/map/search/extract/screenshot modes but still executes the scrape branch (except unblock), while reporting the requested mode. Fast/auto/extract also send <code>proxy: isp</code> together with deprecated <code>proxy_enabled: false</code>, leaving proxy behavior backend-dependent.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>README.md:147-161</code>; <code>src/fetch.rs:66-104, 427-433</code>.</p>
+      <p><strong>Fix.</strong> Either restrict <code>/fetch</code> to <code>auto|fast|browser|unblock|raw</code> or dispatch every advertised mode to its matching operation. Stop sending the deprecated proxy boolean.</p>
+      <pre>if route == ProductRoute::Scrape
+    &amp;&amp; !matches!(mode, Auto | Fast | Browser | Unblock | Raw) {
+    return Err(BadRequest("mode is not valid for /fetch".into()));
+}
+
+proxy: Self::proxy_type(payload, mode),
+proxy_enabled: None,</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-05</span><h3>Unicode backend errors can panic while being compacted</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Slicing a UTF-8 string at byte 512 panics if that byte is inside a multibyte character. A credit backend response can therefore abort a request while the service is trying to format an error.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/errors.rs:187-193</code>.</p>
+      <p><strong>Fix.</strong> Truncate at a character boundary and add a regression test with a multibyte character crossing the limit.</p>
+      <pre>fn compact_body(body: &amp;str) -> String {
+    let body = body.trim();
+    if body.len() &lt;= 512 { return body.to_owned(); }
+    let end = (0..=512).rev()
+        .find(|i| body.is_char_boundary(*i)).unwrap_or(0);
+    format!("{}...", &amp;body[..end])
+}</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-06</span><h3>MCP OAuth is introspected twice and its advertised scope/audience contract is inconsistent</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> MCP middleware introspects once, discards the context, and the tool introspects again. This doubles latency/load and doubles dependency-failure probability. The metadata advertises <code>resolver:mcp:tools:list</code>, but the MCP gate accepts only fetch scopes; a legacy base audience is also accepted automatically.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/mcp.rs:332-350, 610-621</code>; <code>src/auth.rs:354-375</code>.</p>
+      <p><strong>Fix.</strong> Insert the validated context into request extensions and reuse it in tool dispatch. Apply method-specific discovery/tool scopes, and require explicit configuration before accepting the legacy audience.</p>
+      <pre>// middleware
+request.extensions_mut().insert(validated_context);
+
+// tool
+let auth_context = parts.extensions.get::&lt;ResolverAuthContext&gt;()
+    .ok_or(Unauthorized)?;
+
+// Do not append LEGACY_RESOLVER_AUDIENCE unless explicitly configured.</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-07</span><h3>The dependency lockfile fails the security audit</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Automated security gates cannot pass. <code>quinn-proto 0.11.14</code> is covered by a high-severity remote memory-exhaustion advisory and <code>anyhow 1.0.102</code> by an unsoundness advisory. Current <code>cargo tree</code> does not show either package in the active target graph, which lowers demonstrated runtime exposure but does not justify leaving a red lockfile.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>Cargo.lock</code>; RUSTSEC-2026-0185 and RUSTSEC-2026-0190 from the 2026-08-17 RustSec database.</p>
+      <p><strong>Fix.</strong> Refresh the lockfile to <code>quinn-proto &gt;=0.11.15</code> and <code>anyhow &gt;=1.0.103</code>, remove stale inactive packages where possible, and gate every pull request with <code>cargo audit</code> plus a documented exception file for truly unreachable advisories.</p>
+      <pre>cargo update -p quinn-proto --precise 0.11.15
+cargo update -p anyhow --precise 1.0.103
+cargo audit --deny warnings</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-08</span><h3>The MCP tool is advertised as read-only despite billing and durable/public side effects</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Clients may make approval and retry decisions based on <code>readOnlyHint=true</code>, but the call debits credits, writes a receipt, and can trigger irreversible provenance publication.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/mcp.rs:148-157, 194-241</code>; provenance publication in C-01.</p>
+      <p><strong>Fix.</strong> Set the hint to false and describe billing/publication in the tool description. If a truly read-only tool is required, separate preview/fetch from charge-and-publish.</p>
+      <pre>annotations(
+    title = "Fetch Source",
+    read_only_hint = false,
+    destructive_hint = false,
+    open_world_hint = true
+)</pre>
+    </div>
+  </article>
+
+  <article class="finding medium">
+    <header><span class="badge">Medium M-09</span><h3>Production lifecycle support is incomplete</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> <code>/healthz</code> proves only that the process can answer; it does not check readiness for Spider/auth/credits. There is no graceful shutdown, drain behavior, metrics endpoint, gateway/rate-limit manifest, MCP session-stickiness guidance, or deployment artifact. The README delegates these controls to infrastructure that is absent from the repository.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/main.rs:91-125</code>; <code>README.md:185-193</code>.</p>
+      <p><strong>Fix.</strong> Add separate liveness/readiness endpoints, graceful cancellation, structured metrics, and versioned deployment/gateway configuration. Readiness should validate configuration and dependency reachability without consuming credits.</p>
+      <pre>axum::serve(listener, app)
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
+
+GET /livez  - process only
+GET /readyz - config + dependency readiness
+GET /metrics</pre>
+    </div>
+  </article>
+
+  <article class="finding low">
+    <header><span class="badge">Low L-01</span><h3>Strict linting and production-code hygiene are not clean</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Clippy cannot be promoted to a blocking gate. Experimental <code>attest.rs</code> contains placeholder code and panicking <code>expect</code>s; receipts include <code>demo_message: "amazing job"</code>; the declared <code>mcp</code> feature does not gate MCP code.</p>
+      <p class="evidence"><strong>Evidence.</strong> strict Clippy output; <code>src/attest.rs</code>; <code>src/fetch.rs:700-713</code>; <code>Cargo.toml:7-9</code>.</p>
+      <p><strong>Fix.</strong> Resolve all seven Clippy diagnostics, delete or test/gate experimental code, remove demo fields from the public model, and either implement feature gates or remove the misleading feature.</p>
+      <pre>#![deny(clippy::all)]
+#![deny(unused_must_use)]
+
+#[cfg(feature = "mcp")]
+mod mcp;</pre>
+    </div>
+  </article>
+
+  <article class="finding low">
+    <header><span class="badge">Low L-02</span><h3>API, release, and product documentation still have explicit gaps</h3></header>
+    <div class="body">
+      <p><strong>Impact.</strong> Unknown JSON fields are silently ignored, <code>/snapshot</code> is missing from the README route table, there is no OpenAPI contract or ready-to-use MCP config, and package/release essentials such as license, Rust version/toolchain, changelog, and deployment instructions are absent. The README also explicitly lists residential proxy rotation, prompt interaction, and Obscura headless as unfinished.</p>
+      <p class="evidence"><strong>Evidence.</strong> <code>src/types.rs:117-211</code>; <code>README.md:5-13, 149-160</code>; <code>SKILL.md:29</code>; repository file list.</p>
+      <p><strong>Fix.</strong> Add strict request schemas, publish OpenAPI/JSON Schema, provide <code>mcp.example.json</code>, document all routes/env vars, declare the supported Rust version and license, and either schedule or remove each advertised backlog item.</p>
+      <pre>#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductRequest { /* ... */ }
+
+[package]
+rust-version = "&lt;verified-msrv&gt;"
+license = "&lt;project-license&gt;"</pre>
+    </div>
+  </article>
+
+  <h2>Remediation order</h2>
+  <section class="priority">
+    <ol>
+      <li><strong>Disable implicit/public provenance behavior</strong> and add disclosure regression tests before any live traffic.</li>
+      <li><strong>Replace receipt storage</strong> with tenant/project-scoped, durable, random-ID, TTL-bound records.</li>
+      <li><strong>Correct Spider status handling</strong>; ensure failed upstream calls cannot become success receipts/provenance.</li>
+      <li><strong>Restore MCP host validation and enforce source egress policy</strong>, including redirect/DNS checks.</li>
+      <li><strong>Bound response memory, backend durations, and MCP sessions.</strong></li>
+      <li><strong>Make the build self-contained and add CI</strong> for fmt, Clippy, unit/integration tests, RustSec, and secret scanning.</li>
+      <li><strong>Unify all routes</strong> behind the same auth, credit, receipt, provenance, timeout, and error pipeline.</li>
+      <li><strong>Finish contract and operations work</strong>: idempotency, route/mode semantics, readiness, shutdown, metrics, deployment, and docs.</li>
+    </ol>
+  </section>
+
+  <h2>What is missing</h2>
+  <ul class="checklist">
+    <li>Tenant-safe durable receipt repository with TTL/capacity and random IDs.</li>
+    <li>Explicit, private-by-default provenance consent and disclosure policy.</li>
+    <li>SSRF/egress policy and separate authorization for internal destinations.</li>
+    <li>Self-contained dependency strategy and reproducible clean-clone build.</li>
+    <li>CI/CD gates, pinned Rust toolchain, dependency policy, and release metadata.</li>
+    <li>Integration/E2E/concurrency tests with mock auth, credits, Spider, and provenance services.</li>
+    <li>Bounded upstream responses, MCP session eviction, and complete timeout coverage.</li>
+    <li>Product idempotency and documented charge/refund/route-pricing semantics.</li>
+    <li>Readiness, graceful shutdown, metrics, rate-limit/gateway and multi-replica guidance.</li>
+    <li>OpenAPI/JSON Schema, strict unknown-field rejection, complete route/env docs, and MCP config.</li>
+    <li>README backlog: residential proxy rotations, prompt interaction, and Obscura headless research.</li>
+  </ul>
+
+  <p class="note">Scope note: this repository contains no on-chain Solana program, so signer/PDA/account-ownership and compute-unit checks from the selected review rubric were not applicable. The relevant HTTP, OAuth, MCP, billing, provenance, supply-chain, and production controls were reviewed instead. This is a code and configuration audit, not a formal penetration test of deployed Livy or Spider infrastructure.</p>
+</main>
+</body>
+</html>
