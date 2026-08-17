@@ -190,7 +190,10 @@ the complete validated execution plan, caller key, authenticated scope,
 effective amount, and pricing version. Reusing a caller key for a different
 request returns HTTP 409 within a replica; across replicas the different
 fingerprint produces a different debit key, so it cannot reuse the first
-request's debit.
+request's debit. Once a replica has captured a request, retrying that same key
+returns HTTP 409 before Spider because the resolver has no durable prior-result
+cache. After a restart, a generic credit-ledger row is never accepted as proof
+of an enforced capture: insufficient balance still fails before Spider.
 `LIVY_RESOLVER_REQUEST_CREDIT_COST` is the default price; deployments can set
 route-specific overrides such as `LIVY_RESOLVER_CREDIT_COST_CRAWL`,
 `LIVY_RESOLVER_CREDIT_COST_SCREENSHOT`, and

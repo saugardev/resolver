@@ -149,14 +149,6 @@ struct ResolverCreditBalance {
     balance: i64,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResolverCreditLedgerEntry {
-    entry_type: String,
-    idempotency_key: Option<String>,
-    #[serde(default)]
-    metadata: Value,
-}
-
 impl ResolverCreditDebitOutcome {
     pub fn permits_work(&self) -> bool {
         self.enforced || (self.mode == "idempotent_replay" && !self.charged)
@@ -264,12 +256,14 @@ impl ResolverCreditsClient {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let mut caller_scope = None;
-        let mut captured_replay = false;
         if let Some(requested) = requested_idempotency_key {
             let scope = caller_idempotency_scope(auth_context, requested)?;
-            captured_replay = self
+            let already_finalized = self
                 .idempotency_bindings
                 .bind(&scope, &request_fingerprint)?;
+            if already_finalized {
+                return Err(ResolverCreditsError::IdempotencyAlreadyFinalized);
+            }
             caller_scope = Some(scope);
         }
         let idempotency_key = resolver_request_idempotency_key(
@@ -307,16 +301,8 @@ impl ResolverCreditsClient {
             metadata.insert("subject_id".to_string(), json!(subject_id));
         }
 
-        if !captured_replay {
-            self.require_available_balance(
-                tenant_id,
-                access_token,
-                amount,
-                requested_idempotency_key.map(|_| idempotency_key.as_str()),
-                &request_fingerprint,
-            )
+        self.require_available_balance(tenant_id, access_token, amount)
             .await?;
-        }
 
         Ok(Some(ResolverCreditAuthorization {
             access_token: access_token.to_string(),
@@ -383,8 +369,6 @@ impl ResolverCreditsClient {
         tenant_id: &str,
         access_token: &str,
         amount: i64,
-        replay_idempotency_key: Option<&str>,
-        request_fingerprint: &str,
     ) -> Result<(), ResolverCreditsError> {
         let response = self
             .http
@@ -405,56 +389,10 @@ impl ResolverCreditsClient {
         if balance.balance >= amount {
             return Ok(());
         }
-        if let Some(idempotency_key) = replay_idempotency_key
-            && self
-                .debit_already_captured(
-                    tenant_id,
-                    access_token,
-                    idempotency_key,
-                    request_fingerprint,
-                )
-                .await?
-        {
-            return Ok(());
-        }
         Err(ResolverCreditsError::InsufficientCredits {
             balance: balance.balance,
             required: amount,
         })
-    }
-
-    async fn debit_already_captured(
-        &self,
-        tenant_id: &str,
-        access_token: &str,
-        idempotency_key: &str,
-        request_fingerprint: &str,
-    ) -> Result<bool, ResolverCreditsError> {
-        let response = self
-            .http
-            .get(self.ledger_endpoint(tenant_id))
-            .headers(self.headers(access_token)?)
-            .send()
-            .await
-            .map_err(ResolverCreditsError::Http)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ResolverCreditsError::Backend { status, body });
-        }
-        let entries = response
-            .json::<Vec<ResolverCreditLedgerEntry>>()
-            .await
-            .map_err(ResolverCreditsError::Http)?;
-        Ok(entries.iter().any(|entry| {
-            entry.entry_type == "debit"
-                && entry.idempotency_key.as_deref() == Some(idempotency_key)
-                && entry
-                    .metadata
-                    .get("request_fingerprint")
-                    .and_then(Value::as_str)
-                    == Some(request_fingerprint)
-        }))
     }
 
     fn debit_endpoint(&self, tenant_id: &str) -> String {
@@ -467,13 +405,6 @@ impl ResolverCreditsClient {
     fn balance_endpoint(&self, tenant_id: &str) -> String {
         format!(
             "{}/api/v1/tenants/{}/users/me/credits",
-            self.backend_base_url, tenant_id
-        )
-    }
-
-    fn ledger_endpoint(&self, tenant_id: &str) -> String {
-        format!(
-            "{}/api/v1/tenants/{}/users/me/credit-ledger",
             self.backend_base_url, tenant_id
         )
     }
@@ -673,7 +604,7 @@ mod tests {
     use reqwest::StatusCode;
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     };
 
     fn auth() -> ResolverAuthContext {
@@ -772,14 +703,14 @@ mod tests {
     }
 
     #[test]
-    fn caller_key_binding_replays_same_request_and_rejects_different_request() {
+    fn caller_key_binding_tracks_pending_retry_and_rejects_different_request() {
         let registry = IdempotencyBindingRegistry {
             entries: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(60),
             max_entries: 4,
         };
-        registry.bind("caller-scope", "fingerprint-a").unwrap();
-        registry.bind("caller-scope", "fingerprint-a").unwrap();
+        assert!(!registry.bind("caller-scope", "fingerprint-a").unwrap());
+        assert!(!registry.bind("caller-scope", "fingerprint-a").unwrap());
         assert!(matches!(
             registry.bind("caller-scope", "fingerprint-b"),
             Err(ResolverCreditsError::IdempotencyConflict)
@@ -946,6 +877,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn locally_finalized_request_stops_before_balance_or_work() {
+        let balance_checks = Arc::new(AtomicUsize::new(0));
+        let debit_calls = Arc::new(AtomicUsize::new(0));
+        let checks_for_handler = balance_checks.clone();
+        let debits_for_handler = debit_calls.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credits",
+                get(move || {
+                    let checks = checks_for_handler.clone();
+                    async move {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"balance": 10}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credits/debits",
+                post(move || {
+                    let debits = debits_for_handler.clone();
+                    async move {
+                        debits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "mode": "enforce",
+                            "enforced": true,
+                            "charged": true,
+                            "amount": 1,
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ResolverCreditsClient {
+            enabled: true,
+            backend_base_url: format!("http://{address}"),
+            amount: 1,
+            http: reqwest::Client::new(),
+            idempotency_bindings: IdempotencyBindingRegistry::default(),
+        };
+        let auth = auth();
+        let logical_request = json!({"source": "https://example.com"});
+
+        let authorization = client
+            .preflight_product_request(
+                &auth,
+                "finalized_regression",
+                Some("https://example.com"),
+                None,
+                &logical_request,
+                Some("same-key"),
+            )
+            .await
+            .unwrap();
+        client
+            .capture_authorized_request(authorization)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .preflight_product_request(
+                    &auth,
+                    "finalized_regression",
+                    Some("https://example.com"),
+                    None,
+                    &logical_request,
+                    Some("same-key"),
+                )
+                .await,
+            Err(ResolverCreditsError::IdempotencyAlreadyFinalized)
+        ));
+        assert_eq!(balance_checks.load(Ordering::SeqCst), 1);
+        assert_eq!(debit_calls.load(Ordering::SeqCst), 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn unenforced_success_does_not_mark_binding_captured_for_retry() {
         let balance_checks = Arc::new(AtomicUsize::new(0));
         let checks_for_handler = balance_checks.clone();
@@ -1040,10 +1051,6 @@ mod tests {
                 }),
             )
             .route(
-                "/api/v1/tenants/{tenant_id}/users/me/credit-ledger",
-                get(|| async { Json(json!([])) }),
-            )
-            .route(
                 "/api/v1/tenants/{tenant_id}/users/me/credits/debits",
                 post(|| async {
                     Json(json!({
@@ -1105,58 +1112,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn depleted_balance_still_allows_an_exact_captured_replay() {
+    async fn shadow_ledger_row_never_authorizes_retry_after_restart() {
+        #[derive(Default)]
+        struct BackendState {
+            balance: AtomicI64,
+            balance_checks: AtomicUsize,
+            debit_calls: AtomicUsize,
+            ledger_calls: AtomicUsize,
+            last_debit: Mutex<Option<Value>>,
+        }
+
+        let backend = Arc::new(BackendState {
+            balance: AtomicI64::new(1),
+            ..BackendState::default()
+        });
+        let balance_backend = backend.clone();
+        let debit_backend = backend.clone();
+        let ledger_backend = backend.clone();
         let app = Router::new()
             .route(
                 "/api/v1/tenants/{tenant_id}/users/me/credits",
-                get(|| async { Json(json!({"balance": 0})) }),
+                get(move || {
+                    let backend = balance_backend.clone();
+                    async move {
+                        backend.balance_checks.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"balance": backend.balance.load(Ordering::SeqCst)}))
+                    }
+                }),
             )
             .route(
                 "/api/v1/tenants/{tenant_id}/users/me/credit-ledger",
-                get(|| async {
-                    Json(json!([{
-                        "entry_type": "debit",
-                        "idempotency_key": "resolver_fetch:fingerprint-a",
-                        "metadata": {"request_fingerprint": "fingerprint-a"}
-                    }]))
+                get(move || {
+                    let backend = ledger_backend.clone();
+                    async move {
+                        backend.ledger_calls.fetch_add(1, Ordering::SeqCst);
+                        let debit = backend.last_debit.lock().unwrap().clone();
+                        let row = debit.map(|body| {
+                            json!({
+                                "entry_type": "debit",
+                                "idempotency_key": body["idempotency_key"],
+                                "metadata": {
+                                    "request_fingerprint": body["metadata"]["request_fingerprint"]
+                                }
+                            })
+                        });
+                        Json(row.map_or_else(|| json!([]), |row| json!([row])))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/tenants/{tenant_id}/users/me/credits/debits",
+                post(move |Json(body): Json<Value>| {
+                    let backend = debit_backend.clone();
+                    async move {
+                        backend.debit_calls.fetch_add(1, Ordering::SeqCst);
+                        backend.balance.store(0, Ordering::SeqCst);
+                        *backend.last_debit.lock().unwrap() = Some(body);
+                        Json(json!({
+                            "mode": "shadow",
+                            "enforced": false,
+                            "charged": true,
+                            "amount": 1,
+                        }))
+                    }
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = ResolverCreditsClient {
+        let new_client = || ResolverCreditsClient {
             enabled: true,
             backend_base_url: format!("http://{address}"),
             amount: 1,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
-                .build()
-                .unwrap(),
+            http: reqwest::Client::new(),
             idempotency_bindings: IdempotencyBindingRegistry::default(),
         };
+        let auth = auth();
+        let logical_request = json!({"source": "https://example.com"});
+        let spider_calls = AtomicUsize::new(0);
+        let evidence_calls = AtomicUsize::new(0);
 
-        client
-            .require_available_balance(
-                "tenant-a",
-                "token",
-                1,
-                Some("resolver_fetch:fingerprint-a"),
-                "fingerprint-a",
+        let first_client = new_client();
+        let authorization = first_client
+            .preflight_product_request(
+                &auth,
+                "restart_regression",
+                Some("https://example.com"),
+                None,
+                &logical_request,
+                Some("same-key"),
             )
             .await
             .unwrap();
+        spider_calls.fetch_add(1, Ordering::SeqCst);
+        let first_capture = first_client.capture_authorized_request(authorization).await;
+        if first_capture.is_ok() {
+            evidence_calls.fetch_add(1, Ordering::SeqCst);
+        }
         assert!(matches!(
-            client
-                .require_available_balance(
-                    "tenant-a",
-                    "token",
-                    1,
-                    Some("resolver_fetch:fingerprint-a"),
-                    "fingerprint-b",
-                )
-                .await,
-            Err(ResolverCreditsError::InsufficientCredits { .. })
+            first_capture,
+            Err(ResolverCreditsError::UntrustedDebitOutcome { .. })
         ));
+        assert!(backend.last_debit.lock().unwrap().is_some());
+
+        // A new client has no in-memory binding, exactly like a restarted replica.
+        let restarted_client = new_client();
+        let retry = restarted_client
+            .preflight_product_request(
+                &auth,
+                "restart_regression",
+                Some("https://example.com"),
+                None,
+                &logical_request,
+                Some("same-key"),
+            )
+            .await;
+        let retry_error = match retry {
+            Ok(authorization) => {
+                spider_calls.fetch_add(1, Ordering::SeqCst);
+                if restarted_client
+                    .capture_authorized_request(authorization)
+                    .await
+                    .is_ok()
+                {
+                    evidence_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                None
+            }
+            Err(err) => Some(err),
+        };
+
+        assert!(matches!(
+            retry_error,
+            Some(ResolverCreditsError::InsufficientCredits { .. })
+        ));
+        assert_eq!(spider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.debit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(evidence_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.ledger_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.balance_checks.load(Ordering::SeqCst), 2);
 
         server.abort();
     }
@@ -1196,5 +1290,9 @@ mod tests {
             body: r#"{"code":"idempotency_conflict"}"#.to_string(),
         };
         assert!(conflict.is_idempotency_conflict());
+        assert!(ResolverCreditsError::IdempotencyAlreadyFinalized.is_idempotency_conflict());
+        assert!(
+            ResolverCreditsError::IdempotencyAlreadyFinalized.is_idempotency_already_finalized()
+        );
     }
 }

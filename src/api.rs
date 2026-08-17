@@ -466,6 +466,10 @@ async fn preflight_product_route(
     {
         Ok(authorization) => Ok(authorization),
         Err(err) if err.is_payment_required() => Err(FetchError::PaymentRequired(err.to_string())),
+        Err(err) if err.is_idempotency_already_finalized() => Err(FetchError::IdempotencyConflict(
+            "Idempotency-Key was already finalized; the prior result is not available for replay"
+                .to_string(),
+        )),
         Err(err) if err.is_idempotency_conflict() => Err(FetchError::IdempotencyConflict(
             "Idempotency-Key was already used for a different logical request".to_string(),
         )),

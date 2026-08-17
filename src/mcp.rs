@@ -260,7 +260,10 @@ impl Server {
                         "payment_required": err.is_payment_required(),
                     })
                 );
-                let message = if err.is_idempotency_conflict() {
+                let message = if err.is_idempotency_already_finalized() {
+                    "Idempotency key was already finalized; the prior result is not available for replay"
+                        .to_string()
+                } else if err.is_idempotency_conflict() {
                     "Idempotency key was already used for a different logical request".to_string()
                 } else if err.is_payment_required() {
                     "Livy payment required".to_string()

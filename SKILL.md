@@ -139,7 +139,9 @@ development, and also set `LIVY_RESOLVER_CREDITS_ENABLED=false`; enabled credit
 enforcement fails closed without an authenticated access token. Authenticated
 credit enforcement also requires a non-empty introspection `sub`; caller
 idempotency is isolated by that OAuth subject as well as tenant, project,
-client, and request fingerprint.
+client, and request fingerprint. A locally finalized key returns a conflict
+before Spider; generic ledger rows are not trusted to authorize replay after a
+restart.
 
 Use `fetch_source` when the user gives an exact URL as the required
 source:

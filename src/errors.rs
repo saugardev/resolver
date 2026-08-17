@@ -69,6 +69,8 @@ pub enum ResolverCreditsError {
     Http(reqwest::Error),
     #[error("idempotency key was already bound to a different logical request")]
     IdempotencyConflict,
+    #[error("idempotency key was already finalized and no durable prior result is available")]
+    IdempotencyAlreadyFinalized,
     #[error("idempotency binding registry failed: {0}")]
     IdempotencyRegistry(String),
     #[error("insufficient user credits: balance {balance}, required {required}")]
@@ -101,13 +103,17 @@ impl ResolverCreditsError {
 
     pub fn is_idempotency_conflict(&self) -> bool {
         match self {
-            Self::IdempotencyConflict => true,
+            Self::IdempotencyConflict | Self::IdempotencyAlreadyFinalized => true,
             Self::Backend { status, body } => {
                 *status == StatusCode::CONFLICT
                     && backend_error_code(body).as_deref() == Some("idempotency_conflict")
             }
             _ => false,
         }
+    }
+
+    pub fn is_idempotency_already_finalized(&self) -> bool {
+        matches!(self, Self::IdempotencyAlreadyFinalized)
     }
 }
 
