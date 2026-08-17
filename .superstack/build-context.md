@@ -6,9 +6,9 @@
 
 | Field | Value |
 |-------|-------|
-| Template | Rust 2024 Axum binary service |
-| Architecture pattern | OAuth-protected HTTP + MCP resolver with Spider, credit debit, receipts, and optional provenance |
-| Completed at | 2026-08-17T13:23:49Z |
+| Template | Rust 2024 Axum library and binary service |
+| Architecture pattern | OAuth-protected HTTP + stateless MCP resolver with bounded Spider transport, enforced credit capture, tenant receipts, and optional private-by-default provenance |
+| Completed at | 2026-08-17T23:30:57Z |
 
 ### Skills Installed
 
@@ -19,7 +19,8 @@
 | Field | Value |
 |-------|-------|
 | MVP complete | Yes |
-| Tests passing | Partial — 39 unit tests pass in a reconstructed dependency layout; clean checkout is blocked by a missing path dependency |
+| Tests passing | Yes — 125 unit tests and 2 external integration tests pass locally, in a fresh archive checkout, and in fork CI |
+| CI status | Pass — Rust/policy/secrets/smoke and hardened production-container jobs at `472f70d` |
 | Devnet deployed | Not applicable |
 | Mainnet deployed | Not applicable |
 | Program ID | — |
@@ -29,45 +30,53 @@
 
 ### Milestones
 
-- [x] Repository-wide source review (2026-08-17T13:23:49Z)
-- [x] Format, unit-test, lint, dependency, history-secret, and smoke checks (2026-08-17T13:23:49Z)
-- [x] Mock upstream failure reproduction (2026-08-17T13:23:49Z)
-- [ ] Critical security and tenancy findings fixed
-- [ ] Clean-clone build and CI established
-- [ ] Boundary integration test suite passing
+- [x] Repository-wide source review (2026-08-17)
+- [x] Worker → fresh reviewer → master loops for all related finding groups (2026-08-18)
+- [x] Critical security, privacy, tenancy, billing, fetch, and MCP findings remediated in repository code (2026-08-18)
+- [x] Clean-checkout build and blocking fork CI established (2026-08-18)
+- [x] Boundary, integration, concurrency, timeout, redirect, and lifecycle suites passing (2026-08-18)
+- [x] Strict Clippy, RustSec, dependency policy, unused-dependency, contract, secret-history, service-smoke, and hardened-container gates passing (2026-08-18)
+- [ ] Owner-selected repository license and matching Cargo metadata
+- [ ] Shared durable tenant-scoped receipt adapter deployed
+- [ ] Backend atomic reserve/capture/cancel with authoritative replay deployed
+- [ ] Remote Spider egress and redirect enforcement deployed and attested
 
 ## Review
 
 | Field | Value |
 |-------|-------|
-| Security score | D |
-| Quality score | C |
-| Ready for mainnet | No |
+| Security score | B+ |
+| Quality score | A |
+| Correctness score | A- |
+| Ready for mainnet/production | No — repository code is accepted, but four external/legal release blockers remain |
 
-### Findings
+### Remediated Findings
 
-| Severity | Category | Description | Fix |
-|----------|----------|-------------|-----|
-| critical | security/privacy | Provenance can activate from the shared backend URL and defaults toward public managed publication of raw source URLs and response artifacts. | Require explicit enablement; default private, unmanaged, and commitment-only; redact source queries and require per-request reveal consent. |
-| critical | authorization/tenancy | Receipts have no tenant/project ownership, predictable IDs, no TTL/cap, no durability, and no replica-safe lookup. | Use tenant/project-scoped durable storage, random IDs, TTL/capacity, and ownership checks. |
-| high | correctness/billing | Spider HTTP 500 was reproduced as resolver HTTP 200 with a new receipt after debit. | Preserve and reject every upstream non-2xx status; test 502/no-receipt/no-provenance behavior. |
-| high | security | MCP allowed-host validation is explicitly disabled. | Configure local and production allowed hosts and test attacker Host rejection. |
-| high | security/SSRF | Private, loopback, link-local, metadata, redirect, and DNS destinations rely on absent deployment egress controls. | Default-deny sensitive ranges and split internal-source resolution behind a separate scope and allow-list. |
-| high | availability | Upstream response bodies, provenance request duration, and MCP session count/idle lifetime are not fully bounded. | Stream/cap responses, set all client timeouts, and cap/expire MCP sessions. |
-| high | build/release | Clean checkout cannot build because the provenance SDK is an absent sibling path dependency; no CI exists. | Use a published/pinned/submodule/workspace dependency and add blocking CI gates. |
-| high | testing | 39 unit tests do not cover service boundaries, tenancy, billing, upstream status, disclosure, limits, or concurrency. | Add injectable clients/router plus integration and E2E suites. |
-| medium | tenancy/provenance | Compatibility and snapshot routes lose OAuth-scoped provenance context or skip the normal receipt/provenance pipeline. | Consolidate all routes through the authenticated execution path. |
-| medium | billing | Product calls lack caller retry idempotency and ignore non-enforced successful debit outcomes. | Support scoped Idempotency-Key, enforce outcome semantics, define route pricing and failed-call policy. |
-| medium | correctness | Adaptive fallback only affects later calls and cannot classify many sanitized error strings. | Perform one synchronous bounded fallback under the same debit and retain structured private error kinds. |
-| medium | correctness | `/fetch` mode behavior and proxy fields contradict the documented contract. | Restrict/dispatch modes correctly and stop sending deprecated `proxy_enabled=false` beside an ISP proxy. |
-| medium | reliability | UTF-8 backend errors can panic at the byte-512 truncation boundary. | Truncate at a valid character boundary and add regression coverage. |
-| medium | auth/reliability | MCP introspects OAuth twice; discovery scope and legacy audience behavior are inconsistent. | Reuse middleware auth context, apply method-specific scopes, and require explicit legacy audience configuration. |
-| medium | supply chain | Cargo audit fails for quinn-proto RUSTSEC-2026-0185 and anyhow RUSTSEC-2026-0190, although neither is in the active target graph. | Refresh/remove stale lock packages and gate CI with audited exceptions only. |
-| medium | MCP contract | `fetch_source` is advertised read-only although it debits credits, stores receipts, and can publish provenance. | Set read-only hint false or split preview from side-effecting execution. |
-| medium | operations | Readiness, graceful shutdown, metrics, gateway/rate-limit deployment, session stickiness, and multi-replica behavior are missing. | Add lifecycle endpoints, graceful drain, metrics, and versioned deployment configuration. |
-| low | quality | Strict Clippy fails; experimental/presentation code and a non-gating feature remain in production sources. | Fix lints, remove/gate experimental code and demo fields, and implement or remove the feature flag. |
-| low | documentation/release | Unknown fields are accepted; OpenAPI, MCP config, complete route docs, toolchain/license/changelog, and listed product features are missing. | Add strict schemas and complete API, release, deployment, and product documentation. |
+| Original severity | Category | Verified outcome |
+|-------------------|----------|------------------|
+| critical | provenance privacy | Explicit activation, private/non-publishing defaults, v1 commitment-only public fields, and authenticated per-request reveal/publication consent |
+| critical | receipt tenancy | UUID identifiers, tenant/project ownership, TTL/capacity, async injectable store boundary, and fail-closed production memory-store policy |
+| high | fetch/billing correctness | Status-aware bounded transport, no redirect following, one absolute deadline, streamed caps, capture only after validated success, and finalization only after enforced request-bound capture |
+| high | MCP/auth/SSRF | Host/origin validation, exact issuer/audience/scope, one-pass auth context, stateless cancellable MCP, local address checks, and authenticated same-origin egress capability readiness |
+| high | build/release | Self-contained registry-only dependency layout, exact Rust toolchain, blocking CI, audited lockfile, non-root pinned container, and fresh-checkout proof |
+| high | testing | 127 tests covering service boundaries, tenancy, billing, retries, redirects, limits, disclosure, lifecycle, concurrency, and external extension points |
+| medium | route/provenance consistency | Product, compatibility, MCP, and snapshot paths share authenticated prepare → capture → finalize behavior and truthful evidence |
+| medium | idempotency | Authenticated subject and exact execution-plan fingerprints bind keys; unenforced, mismatched, generic-ledger, and cross-subject replays fail closed |
+| medium | resilience | Current-request bounded fallback, Unicode-safe diagnostics, readiness/liveness split, graceful cancellation, and low-cardinality metrics |
+| medium/low | contracts and hygiene | Strict unknown-field schemas, exact OpenAPI/MCP examples, warning-free Clippy, removed experimental/demo code, operations/security/contributing/changelog docs |
+
+### Remaining Release Blockers
+
+| Severity | Owner | Requirement |
+|----------|-------|-------------|
+| release blocker | repository owner | Select an authoritative repository license and add matching Cargo metadata before public redistribution |
+| release blocker | resolver deployment | Implement and deploy a shared, durable, tenant-scoped, expiring `ReceiptStoreFactory`; the built-in store is intentionally single-replica and non-durable |
+| release blocker | Livy backend | Provide atomic reserve/capture/cancel bound to caller key and request fingerprint, including authoritative prior-result replay |
+| release blocker | Spider/egress deployment | Enforce public-only DNS answers and every redirect hop at the machine performing the remote fetch, backed by the authenticated readiness capability |
+
+The service fails closed or reports not-ready where repository code can enforce these requirements. This audit does not claim that unobserved production infrastructure satisfies them.
 
 ### Source Reports
 
-- audit-report-2026-08-17.html
+- audit-report-2026-08-17.html — original baseline findings
+- audit-report-2026-08-18-remediated.html — final remediation audit and release decision

@@ -1,94 +1,114 @@
 # Audit Remediation Graph
 
-This branch is the integration baseline for the findings recorded in
-`audit-report-2026-08-17.html` and `.superstack/build-context.md`.
+This file records the completed worker → fresh reviewer → master loop for the
+findings in `audit-report-2026-08-17.html`. The integrated fork branch is
+`saugardev/audit-remediation`; the accepted code tip before this final report is
+`472f70d4945b92312a5170e12a8bfa2167e2c9b9`.
 
 ## Control loop
 
 ```text
 master
-  -> worker (isolated worktree and fork branch)
-  -> fresh reviewer (read-only review and verification)
-  -> master decision
-       -> accept and integrate
-       -> or return concrete findings to the worker and repeat with a new reviewer
+  ├─ groups related findings on one fork branch/workspace
+  ├─ sends context and acceptance criteria to a worker
+  ├─ boots a new read-only reviewer after each worker iteration
+  └─ judges the report
+       ├─ CHANGES_REQUIRED → same worker → new commit → new reviewer
+       └─ ACCEPT → integration branch → integration reviewer → master branch
 ```
 
-The master owns integration, conflict resolution, acceptance, and the final audit.
-Workers must keep changes inside their assigned branch, add tests, run the relevant
-checks, and commit their work. Reviewers do not edit implementation branches.
+Workers owned implementation branches. Reviewers did not edit them. The master
+owned grouping, acceptance, integration, GitHub issue state, and the final audit.
 
-## Related issue groups
+## Completion ledger
+
+| Group | Fork branch | Accepted tip | Final reviewer | Result |
+|-------|-------------|--------------|----------------|--------|
+| Data boundaries, provenance, receipts, billing | `saugardev/fix-data-boundaries` | `03dcd7c` | `data_boundaries_reviewer_4` | ACCEPT |
+| Fetch correctness and resource bounds | `saugardev/fix-fetch-runtime` | `6300c74` | `fetch_runtime_reviewer_3` | ACCEPT |
+| MCP, authentication, egress, lifecycle | `saugardev/fix-mcp-security` | `d962563` | `mcp_security_reviewer_4` | ACCEPT |
+| Combined source integration | `saugardev/source-integration` | `4ab7d90` | `source_integration_reviewer_1` | ACCEPT |
+| Build, CI, tests, contracts, release quality | `saugardev/fix-release-quality` | `472f70d` | `release_quality_reviewer_4` | ACCEPT |
+
+The release-quality branch passed fork CI run
+[`32079887704`](https://github.com/saugardev/resolver/actions/runs/32079887704)
+at its exact tip. Both the Rust/policy/secrets/smoke job and hardened
+production-container job were green.
+
+## Implemented outcomes
 
 ### 1. Data boundaries and billing
 
-- Branch: `saugardev/fix-data-boundaries`
-- Workspace: `data-boundaries`
-- Findings: C-01, C-02, M-01, M-02, and the data/publication part of M-08.
-- Required outcome:
-  - provenance is explicitly enabled and defaults to private/non-publishing;
-  - compatibility and snapshot paths preserve the authenticated caller context;
-  - receipts use unpredictable identifiers, are tenant-owned, expire, and have a
-    bounded store with a production-safe storage abstraction;
-  - product-credit idempotency is caller-controlled and enforcement outcomes are
-    honored before work executes;
-  - tests prove cross-tenant receipt access is denied and unsafe provenance defaults
-    cannot silently activate.
+- Provenance requires explicit activation and defaults to private,
+  non-publishing behavior.
+- Public provenance fields contain SHA-256 commitments; publication and reveal
+  require authenticated request-level consent.
+- Receipts use UUIDs, tenant/project ownership, TTL/capacity, and an async public
+  storage/factory interface with health checks.
+- The built-in memory store is rejected unless an explicit single-replica
+  exception is acknowledged.
+- Credit keys include the authenticated subject and canonical validated
+  execution plan. Unenforced, mismatched, generic-ledger, and cross-subject
+  outcomes cannot finalize evidence.
+- Snapshot and compatibility paths produce evidence from the exact executed plan.
 
 ### 2. Fetch correctness and resource bounds
 
-- Branch: `saugardev/fix-fetch-runtime`
-- Workspace: `fetch-runtime`
-- Findings: H-01, upstream-response portions of H-04, M-03, M-04, and M-05.
-- Required outcome:
-  - every Spider HTTP non-success response becomes an upstream error and cannot be
-    returned or billed as a successful fetch;
-  - upstream calls have explicit deadlines and response-size limits;
-  - adaptive fallback can affect the current request where safe and preserves error
-    classification;
-  - fetch modes and proxy parameters have one validated, documented contract;
-  - diagnostic body compaction is Unicode-safe;
-  - regression tests cover non-2xx responses, timeouts/limits, fallback, proxy
-    conflicts, and multibyte bodies.
+- Every Spider operation uses one application-owned, status-aware transport.
+- Redirect following is disabled; non-success statuses are rejected.
+- One absolute deadline and streamed response cap cover headers and body reads.
+- Adaptive fallback may run once for enumerated challenge statuses under the same
+  deadline; redirects and 5xx bodies cannot become fallback success.
+- Billing order is authenticated preflight → validated pending fetch → enforced,
+  request-bound capture → receipt/provenance finalization.
+- Mode/route combinations are validated, deprecated proxy fields are gone, and
+  diagnostic compaction is Unicode-safe.
 
-### 3. MCP, authentication, and network hardening
+### 3. MCP, authentication, egress, and lifecycle
 
-- Branch: `saugardev/fix-mcp-security`
-- Workspace: `mcp-security`
-- Findings: H-02, H-03, MCP/session portions of H-04, M-06, M-08, and runtime
-  portions of M-09.
-- Required outcome:
-  - MCP host/origin validation is enabled and configurable with secure defaults;
-  - source egress policy blocks loopback, private, link-local, and metadata targets
-    by default, including DNS resolution checks, with an explicit trusted override;
-  - authentication is performed once per request with consistent issuer, audience,
-    and scope enforcement;
-  - MCP sessions and relevant network calls have idle limits, caps, and deadlines;
-  - tool annotations reflect credit, receipt, and provenance side effects;
-  - readiness and graceful shutdown distinguish liveness from dependency health;
-  - security and lifecycle tests exercise the boundaries.
+- RMCP Host and Origin allow-lists are enabled with non-empty secure defaults.
+- OAuth validates issuer, explicit audience, exact scope, and subject once; the
+  resulting context is reused by tool dispatch.
+- Stateless RMCP plus request cancellation, bounded drain, and deadlines prevent
+  detached work after timeout.
+- Local source validation rejects sensitive hostnames, mixed/empty DNS answers,
+  private/special-use addresses, and both IPv4-mapped/translated IPv6 layouts.
+- Remote fetch is fail-closed unless an authenticated, same-origin, bounded
+  capability document attests redirect and DNS enforcement; readiness probes it.
+- Tool descriptors truthfully report billing/storage/publication side effects.
+- Liveness, readiness, graceful shutdown, and metrics have runtime tests.
 
-### 4. Build, CI, tests, and release quality
+### 4. Release quality
 
-- Branch: `saugardev/fix-release-quality`
-- Workspace: `release-quality`
-- Findings: H-05, H-06, M-07, remaining M-09, L-01, and L-02.
-- Dependency: starts after groups 1-3 are accepted and integrated.
-- Required outcome:
-  - a fresh checkout has a reproducible dependency layout or documented bootstrap;
-  - CI gates formatting, compilation, tests, strict Clippy, dependency advisories,
-    and secret scanning;
-  - vulnerable lockfile entries are removed or explicitly proven unreachable and
-    policy-documented;
-  - boundary/integration/concurrency tests cover the integrated application;
-  - dead or experimental code and misleading feature flags are removed or finished;
-  - deployment, MCP client configuration, API contract, license, toolchain, and
-    operational documentation are present and consistent.
+- The repository is self-contained; it has no sibling path, Git, private SDK, or
+  private-source dependency.
+- Rust `1.94.0`, the lockfile, workflow actions, audit tools, and container bases
+  are pinned or policy-controlled.
+- Fork CI gates format, locked all-target/all-feature check and 127 tests, strict
+  Clippy, contracts, ShellCheck, RustSec, cargo-deny, cargo-machete, Gitleaks full
+  history, isolated fresh checkout, service smoke, and a hardened non-root
+  container build/runtime smoke.
+- API schemas reject unknown fields; OpenAPI, MCP client example, operations,
+  dependency, security, contribution, and changelog documentation are present.
+- Experimental/demo artifacts and misleading package/feature identity were removed.
+
+## External release blockers
+
+Repository remediation is accepted, but public or multi-replica production release
+remains blocked until all four are closed:
+
+1. The owner selects an authoritative repository license and matching Cargo metadata.
+2. Deployment supplies a durable, shared, tenant-scoped receipt adapter.
+3. The Livy backend supplies atomic reserve/capture/cancel and authoritative replay.
+4. The remote Spider/policy deployment enforces DNS and every redirect hop and
+   exposes the authenticated readiness capability.
+
+These are also tracked in `docs/release-blockers.md`. Safe defaults and readiness
+signals prevent them from silently degrading into an accepted production posture.
 
 ## Acceptance rule
 
-A branch is accepted only when a fresh reviewer reports no unresolved critical or
-high-severity regression, required checks pass, and the master confirms the change
-meets this file's required outcome. Any remaining infrastructure-dependent item must
-be represented by a safe default, an explicit runtime failure/readiness signal, and a
-tracked production requirement rather than a silent fallback.
+A branch was accepted only after a new reviewer reported no unresolved required
+repo-side blocker, proportionate checks passed, and the master independently judged
+the acceptance criteria. Remaining infrastructure-dependent items are explicit
+release blockers; they are not counted as silently completed work.

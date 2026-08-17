@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Livy Resolver remediation audit — 2026-08-18</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #5b6773;
+      --line: #d8e0e7;
+      --panel: #f7f9fb;
+      --good: #166534;
+      --good-bg: #f0fdf4;
+      --warn: #9a3412;
+      --warn-bg: #fff7ed;
+      --link: #075985;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #fff;
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1120px, calc(100% - 32px)); margin: 36px auto 72px; }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { margin: 0 0 8px; font-size: clamp(30px, 5vw, 49px); letter-spacing: -.03em; }
+    h2 { margin: 40px 0 15px; font-size: 25px; }
+    h3 { margin: 0 0 8px; font-size: 18px; }
+    p { margin: 8px 0 14px; }
+    a { color: var(--link); }
+    code { font: .92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--panel); }
+    ul, ol { padding-left: 23px; }
+    .lede { max-width: 900px; color: var(--muted); font-size: 18px; }
+    .status {
+      display: inline-flex;
+      margin-top: 13px;
+      padding: 8px 12px;
+      border: 1px solid #fdba74;
+      border-radius: 999px;
+      color: var(--warn);
+      background: var(--warn-bg);
+      font-weight: 750;
+    }
+    .meta { color: var(--muted); }
+    .scores { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; margin: 24px 0; }
+    .score { padding: 16px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
+    .score strong { display: block; font-size: 28px; }
+    .score span { color: var(--muted); }
+    .decision { padding: 18px 20px; border-left: 5px solid var(--warn); background: var(--warn-bg); }
+    .decision h2 { margin-top: 0; }
+    .pass { color: var(--good); font-weight: 750; }
+    .blocked { color: var(--warn); font-weight: 750; }
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+    .card { padding: 17px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .blockers { counter-reset: blocker; display: grid; gap: 12px; padding: 0; list-style: none; }
+    .blockers li { padding: 15px 17px; border: 1px solid #fed7aa; border-radius: 10px; background: var(--warn-bg); }
+    .blockers li::before { counter-increment: blocker; content: counter(blocker) ". "; color: var(--warn); font-weight: 800; }
+    .note { color: var(--muted); font-size: 13px; }
+    @media print {
+      main { width: 100%; margin: 0; }
+      .card, tr { break-inside: avoid; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Livy Resolver remediation audit</h1>
+    <p class="lede">Final repository review after the master → worker → fresh reviewer loops for security, tenancy, billing, fetch behavior, MCP, release engineering, contracts, and operations.</p>
+    <div class="status">Repository remediation accepted · production release still blocked</div>
+    <p class="meta">Code tip <code>472f70d4945b92312a5170e12a8bfa2167e2c9b9</code> · branch <code>saugardev/audit-remediation</code> · completed 2026-08-18 (Europe/Madrid)</p>
+  </header>
+
+  <section class="scores" aria-label="Final scores">
+    <div class="score"><strong>B+</strong><span>Overall</span></div>
+    <div class="score"><strong>B+</strong><span>Security</span></div>
+    <div class="score"><strong>A−</strong><span>Correctness</span></div>
+    <div class="score"><strong>A</strong><span>Testing</span></div>
+    <div class="score"><strong>A</strong><span>Code quality</span></div>
+    <div class="score"><strong>B</strong><span>Release posture</span></div>
+  </section>
+
+  <section class="decision">
+    <h2>Executive decision</h2>
+    <p><strong>All required repository-side findings from the 2026-08-17 baseline audit are remediated and independently accepted.</strong> The integrated code is self-contained, warning-free, boundary-tested, policy-audited, and proven in a hardened container on the fork.</p>
+    <p><strong>Do not declare the service production-ready yet.</strong> A public or multi-replica release still depends on an owner-selected license, durable shared receipt storage, an atomic backend credit protocol with authoritative replay, and remote Spider egress enforcement. The service now fails closed or reports not-ready where code can enforce those dependencies.</p>
+  </section>
+
+  <h2>Verification matrix</h2>
+  <table>
+    <thead><tr><th>Gate</th><th>Result</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Fork CI at exact accepted tip</td><td class="pass">Pass</td><td><a href="https://github.com/saugardev/resolver/actions/runs/32079887704">Run 32079887704</a>: both jobs and every step green.</td></tr>
+      <tr><td>Locked compile and test</td><td class="pass">127/127 pass</td><td>125 unit tests plus 2 external integration tests, all targets and all features.</td></tr>
+      <tr><td>Fresh checkout</td><td class="pass">Pass</td><td>Git archive into an isolated tree and target directory; locked check and all 127 tests pass without sibling dependencies.</td></tr>
+      <tr><td>Formatting and strict Clippy</td><td class="pass">Pass</td><td><code>cargo fmt --check</code> and all-target/all-feature Clippy with <code>-D warnings</code>.</td></tr>
+      <tr><td>Dependency security</td><td class="pass">Pass</td><td><code>cargo audit</code> reports no advisory; cargo-deny advisories/bans/sources and cargo-machete pass.</td></tr>
+      <tr><td>Secret history</td><td class="pass">Pass</td><td>Gitleaks complete reachable Git-history scan reports no leak.</td></tr>
+      <tr><td>Contracts and scripts</td><td class="pass">Pass</td><td>OpenAPI validator, YAML/JSON parsing, Ruby syntax, Bash syntax, ShellCheck, and Actionlint.</td></tr>
+      <tr><td>Service boundary smoke</td><td class="pass">Pass</td><td>Liveness, fail-closed readiness, strict JSON rejection, metrics, and SIGTERM behavior.</td></tr>
+      <tr><td>Production container</td><td class="pass">Pass</td><td>Digest-pinned build; UID/GID 10001; loopback-only port; read-only filesystem; all capabilities dropped; no-new-privileges; exact health/readiness/metrics; clean non-OOM exit.</td></tr>
+      <tr><td>Private dependency/source check</td><td class="pass">Pass</td><td>No sibling path, Git, private SDK, private source snapshot, or vendored private object is present in the accepted tree/history.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Independent agent acceptance</h2>
+  <table>
+    <thead><tr><th>Finding group</th><th>Accepted branch tip</th><th>Reviewer result</th></tr></thead>
+    <tbody>
+      <tr><td>Provenance, receipt tenancy, billing</td><td><code>03dcd7c</code></td><td class="pass">ACCEPT — reviewer 4</td></tr>
+      <tr><td>Fetch correctness and resource bounds</td><td><code>6300c74</code></td><td class="pass">ACCEPT — reviewer 3</td></tr>
+      <tr><td>MCP, authentication, egress, lifecycle</td><td><code>d962563</code></td><td class="pass">ACCEPT — reviewer 4</td></tr>
+      <tr><td>Combined source integration</td><td><code>4ab7d90</code></td><td class="pass">ACCEPT — integration reviewer 1</td></tr>
+      <tr><td>Release quality and final CI correction</td><td><code>472f70d</code></td><td class="pass">ACCEPT — reviewers 3 and 4</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Remediation outcomes</h2>
+  <div class="card-grid">
+    <section class="card">
+      <h3>Privacy and tenant data</h3>
+      <ul>
+        <li>Provenance is explicit, private, non-publishing, and commitment-only by default.</li>
+        <li>Public reveal/publication requires authenticated request-level consent.</li>
+        <li>Receipts use UUIDs, tenant/project ownership, TTL/capacity, and disclosure guards.</li>
+        <li>An async public store/factory boundary supports a durable implementation; unsafe memory use is explicit and fail-closed.</li>
+      </ul>
+    </section>
+    <section class="card">
+      <h3>Fetch and billing</h3>
+      <ul>
+        <li>All Spider routes share status rejection, redirect refusal, one deadline, and streamed byte caps.</li>
+        <li>Adaptive fallback affects the current request only for bounded challenge cases.</li>
+        <li>Execution order is preflight → validated pending result → request-bound enforced capture → evidence finalization.</li>
+        <li>Subject, tenant, project, route, exact plan, pricing, and caller key bind idempotency; unsafe replays fail closed.</li>
+      </ul>
+    </section>
+    <section class="card">
+      <h3>MCP and authentication</h3>
+      <ul>
+        <li>Host and Origin allow-lists are enabled; attacker headers are tested.</li>
+        <li>Issuer, audience, scope, and subject are exact; OAuth context is validated once and reused.</li>
+        <li>Stateless RMCP, cancellation tokens, deadlines, and bounded draining stop detached work.</li>
+        <li>Tool descriptors truthfully disclose credit, receipt, and provenance side effects.</li>
+      </ul>
+    </section>
+    <section class="card">
+      <h3>Egress and lifecycle</h3>
+      <ul>
+        <li>Local checks block metadata, loopback, private, link-local, reserved, mixed DNS, and mapped/translated IPv6 bypasses.</li>
+        <li>Source operations require an authenticated same-origin egress capability and live readiness probe.</li>
+        <li>Liveness and readiness are distinct; graceful shutdown and timeout cancellation have runtime regressions.</li>
+        <li>Low-cardinality process-safe metrics are exposed and concurrency-tested.</li>
+      </ul>
+    </section>
+    <section class="card">
+      <h3>Build and supply chain</h3>
+      <ul>
+        <li>The repository is self-contained and uses an exact Rust 1.94.0 toolchain.</li>
+        <li>Lockfile advisories are clean; CI pins workflow actions and audit tooling.</li>
+        <li>Dependabot, cargo-deny, Gitleaks, fresh-checkout, and hardened container gates are blocking.</li>
+        <li>The container is multi-stage, non-root, digest-pinned, and runtime-smoked.</li>
+      </ul>
+    </section>
+    <section class="card">
+      <h3>Contracts and maintainability</h3>
+      <ul>
+        <li>Strict unknown-field schemas cover HTTP, MCP, and nested provenance inputs.</li>
+        <li>OpenAPI enumerates audited response behavior; the MCP example and operations runbook match runtime behavior.</li>
+        <li>Experimental/demo artifacts, stale package identity, inert features, and misspelled route aliases are removed.</li>
+        <li>Security, contributing, dependency policy, release blockers, and changelog documents are checked in.</li>
+      </ul>
+    </section>
+  </div>
+
+  <h2>Original finding disposition</h2>
+  <table>
+    <thead><tr><th>IDs</th><th>Disposition</th><th>Residual boundary</th></tr></thead>
+    <tbody>
+      <tr><td>C-01, C-02</td><td class="pass">Repository fix accepted</td><td>Durable receipt adapter remains a deployment blocker.</td></tr>
+      <tr><td>H-01, H-04</td><td class="pass">Repository fix accepted</td><td>Atomic backend reserve/capture/cancel is still required for crash-safe authoritative replay.</td></tr>
+      <tr><td>H-02, H-03</td><td class="pass">Repository fix accepted</td><td>Remote fetch host must enforce DNS and every redirect hop; local checks alone cannot prove it.</td></tr>
+      <tr><td>H-05, H-06</td><td class="pass">Repository fix accepted</td><td>No code residual.</td></tr>
+      <tr><td>M-01–M-09</td><td class="pass">Repository fixes accepted</td><td>External credit and egress guarantees remain tracked above.</td></tr>
+      <tr><td>L-01</td><td class="pass">Resolved</td><td>No code residual.</td></tr>
+      <tr><td>L-02</td><td class="pass">Repository docs/contracts resolved</td><td>License selection cannot be invented by the audit.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Release blockers</h2>
+  <ol class="blockers">
+    <li><strong>License.</strong> The repository owner must select an authoritative license and add matching Cargo metadata before public redistribution.</li>
+    <li><strong>Durable receipts.</strong> Production must supply a shared, tenant-scoped, expiring receipt adapter. The included memory implementation is intentionally non-durable and single-replica.</li>
+    <li><strong>Atomic credits and replay.</strong> The Livy backend must add reserve/capture/cancel bound to the caller key and request fingerprint, including authoritative replay of the original resolver result.</li>
+    <li><strong>Remote egress.</strong> The Spider/policy deployment must enforce public-only DNS answers and every redirect hop at the machine making the request, and expose the authenticated readiness capability.</li>
+  </ol>
+
+  <h2>Final recommendation</h2>
+  <p>Merge or deploy the remediated code only into an environment that remains fail-closed while the four blockers are open. Close each blocker with an integration test and operations-runbook update, then run the same CI and an environment-level penetration/egress test before changing the production-readiness decision.</p>
+
+  <p class="note">Scope: this repository contains no on-chain Solana program, so signer/PDA/account-ownership and compute-unit checks were not applicable. This was a code, dependency, contract, local boundary, and fork-CI audit—not a formal penetration test of deployed Livy, Spider, DNS, proxy, or storage infrastructure. The original baseline remains in <a href="audit-report-2026-08-17.html">audit-report-2026-08-17.html</a>.</p>
+</main>
+</body>
+</html>
