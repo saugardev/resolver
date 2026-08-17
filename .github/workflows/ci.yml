@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out complete history
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # releases/v6 commit (2026-07-16)
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -100,7 +100,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # releases/v6 commit (2026-07-16)
         with:
           persist-credentials: false
 
