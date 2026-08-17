@@ -3,10 +3,7 @@
 use crate::auth::ResolverAuthContext;
 use crate::errors::ResolverCreditsError;
 use livy_provenance_sdk::DEFAULT_LIVY_API_BASE_URL;
-use reqwest::{
-    StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
-};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -31,6 +28,13 @@ pub struct ResolverCreditDebitOutcome {
     pub enforced: bool,
     pub charged: bool,
     pub amount: i64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ResolverCreditBalance {
+    balance: i64,
 }
 
 impl ResolverCreditsClient {
@@ -41,12 +45,75 @@ impl ResolverCreditsClient {
             amount: resolver_request_credit_amount_from_env(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("resolver credits HTTP client should initialize"),
         }
     }
 
-    pub async fn debit_fetch_source(
+    /// Verify credit entitlement without consuming credits.
+    ///
+    /// This deliberately remains a preflight rather than a reservation. The
+    /// debit after upstream success is authoritative because the balance can
+    /// change between these two calls.
+    pub async fn preflight(
+        &self,
+        auth_context: &ResolverAuthContext,
+    ) -> Result<(), ResolverCreditsError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let Some(access_token) = auth_context.access_token.as_deref() else {
+            return Ok(());
+        };
+        let tenant_id = auth_context
+            .tenant_id
+            .as_deref()
+            .ok_or(ResolverCreditsError::MissingAuth("tenant_id"))?;
+        let response = self
+            .http
+            .get(self.balance_endpoint(tenant_id))
+            .headers(self.headers(access_token)?)
+            .send()
+            .await
+            .map_err(ResolverCreditsError::Http)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ResolverCreditsError::Backend { status, body });
+        }
+
+        let balance = response
+            .json::<ResolverCreditBalance>()
+            .await
+            .map_err(ResolverCreditsError::Http)?;
+        if balance.balance < self.amount {
+            return Err(ResolverCreditsError::InsufficientCredits {
+                available: balance.balance,
+                required: self.amount,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(backend_base_url: String) -> Self {
+        Self {
+            enabled: true,
+            backend_base_url: trim_trailing_slash(&backend_base_url),
+            amount: 1,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(1))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("test credits client"),
+        }
+    }
+
+    /// Capture a fetch-source charge after the upstream result is validated.
+    pub async fn capture_fetch_source(
         &self,
         auth_context: &ResolverAuthContext,
         source_url: &str,
@@ -68,12 +135,14 @@ impl ResolverCreditsClient {
         .await
     }
 
-    pub async fn debit_product_request(
+    /// Capture a product charge after the upstream result is validated.
+    pub async fn capture_product_request(
         &self,
         auth_context: &ResolverAuthContext,
         route: &str,
         source_url: Option<&str>,
         subject_id: Option<&str>,
+        requested_idempotency_key: Option<&str>,
     ) -> Result<Option<ResolverCreditDebitOutcome>, ResolverCreditsError> {
         self.debit_request(
             auth_context,
@@ -82,7 +151,7 @@ impl ResolverCreditsClient {
                 route,
                 source_url,
                 subject_id,
-                requested_idempotency_key: None,
+                requested_idempotency_key,
                 metadata: json!({
                     "product_route": route,
                 }),
@@ -130,7 +199,7 @@ impl ResolverCreditsClient {
 
         let response = self
             .http
-            .post(self.endpoint(tenant_id))
+            .post(self.debit_endpoint(tenant_id))
             .headers(self.headers(access_token)?)
             .json(&json!({
                 "amount": self.amount,
@@ -149,14 +218,28 @@ impl ResolverCreditsClient {
             return Err(ResolverCreditsError::Backend { status, body });
         }
 
-        response
+        let outcome = response
             .json::<ResolverCreditDebitOutcome>()
             .await
-            .map(Some)
-            .map_err(ResolverCreditsError::Http)
+            .map_err(ResolverCreditsError::Http)?;
+        if !outcome.charged || outcome.amount != self.amount {
+            return Err(ResolverCreditsError::CaptureNotApplied(
+                outcome.reason.clone().unwrap_or_else(|| {
+                    "backend returned an uncharged or mismatched outcome".into()
+                }),
+            ));
+        }
+        Ok(Some(outcome))
     }
 
-    fn endpoint(&self, tenant_id: &str) -> String {
+    fn balance_endpoint(&self, tenant_id: &str) -> String {
+        format!(
+            "{}/api/v1/tenants/{}/users/me/credits",
+            self.backend_base_url, tenant_id
+        )
+    }
+
+    fn debit_endpoint(&self, tenant_id: &str) -> String {
         format!(
             "{}/api/v1/tenants/{}/users/me/credits/debits",
             self.backend_base_url, tenant_id
@@ -279,6 +362,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
 
     #[test]
     fn idempotency_key_uses_client_supplied_value_when_present() {

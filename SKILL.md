@@ -185,6 +185,15 @@ accept `auto` or their matching mode. Use `proxy` with
 rejected. Auto/fast may make one in-deadline unblock attempt when the initial
 response is a recognized anti-bot challenge.
 
+OAuth-protected fetches validate input and perform a non-consuming Livy credit
+balance preflight before Spider. They capture the idempotent debit only after a
+bounded, deadline-constrained Spider result succeeds, and create the receipt and
+provenance evidence only after capture. Upstream failures, redirects, timeouts,
+and oversized bodies do not capture or finalize. Because the backend does not
+yet support atomic reserve/capture/cancel, capture remains authoritative and can
+still lose a post-preflight balance race; a backend reservation API is required
+to eliminate that residual cost-abuse window.
+
 ## Code Map
 
 - `src/main.rs`: mounts HTTP routes and `/mcp`

@@ -178,7 +178,11 @@ impl Server {
             ))]));
         }
 
-        // Keep every fetch path, including cached unblock fallback, behind auth and credit debit.
+        // The current credit backend has only balance and immediate debit
+        // endpoints, not reserve/capture/refund. Preflight before doing Spider
+        // work, then prepare a validated result, capture idempotently, and only
+        // then finalize evidence. Capture remains authoritative because the
+        // balance can change after preflight.
         let started = Instant::now();
         let source_sha256 = crate::security::sensitive_hash(&url);
         eprintln!(
@@ -191,16 +195,79 @@ impl Server {
                 "source_sha256": &source_sha256,
             })
         );
+        if let Err(err) = self.credits.preflight(&auth_context).await {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "mcp_credit_preflight_failed",
+                    "request_id": crate::security::current_request_id(),
+                    "source_sha256": &source_sha256,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "payment_required": err.is_payment_required(),
+                })
+            );
+            let message = if err.is_payment_required() {
+                "Livy payment required"
+            } else {
+                "Livy credit authorization service is unavailable"
+            };
+            return Ok(CallToolResult::error(vec![Content::text(message)]));
+        }
+        let cache_key = normalize_fallback_url_key(&url);
+        let fallback_reason = self.fallback_cache.lookup(&cache_key);
+        let pending_result = if let Some(reason) = fallback_reason {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "mcp_fetch_source_fallback",
+                    "request_id": crate::security::current_request_id(),
+                    "mode": "unblock",
+                    "reason": reason,
+                    "source_sha256": &source_sha256,
+                })
+            );
+            self.fetcher
+                .prepare_product_fetch(
+                    Fetcher::unblock_request(&url, true),
+                    crate::types::ProductRoute::Unblock,
+                )
+                .await
+        } else {
+            self.fetcher
+                .prepare_product_fetch(
+                    Fetcher::fast_request(&url),
+                    crate::types::ProductRoute::Scrape,
+                )
+                .await
+        };
+        let pending = match pending_result {
+            Ok(pending) => pending,
+            Err(error) => {
+                analyze_fetch_error_in_background(self.fallback_cache.clone(), cache_key, &error);
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_fetch_source_failed",
+                        "request_id": crate::security::current_request_id(),
+                        "mode": if fallback_reason.is_some() { "unblock" } else { "fast" },
+                        "source_sha256": &source_sha256,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    })
+                );
+                return Err(ErrorData::internal_error("Upstream fetch failed", None));
+            }
+        };
+
         match self
             .credits
-            .debit_fetch_source(&auth_context, &url, idempotency_key.as_deref())
+            .capture_fetch_source(&auth_context, &url, idempotency_key.as_deref())
             .await
         {
             Ok(Some(outcome)) => {
                 eprintln!(
                     "{}",
                     json!({
-                        "event": "mcp_credit_debit",
+                        "event": "mcp_credit_capture",
                         "request_id": crate::security::current_request_id(),
                         "source_sha256": &source_sha256,
                         "charged": outcome.charged,
@@ -214,7 +281,7 @@ impl Server {
                 eprintln!(
                     "{}",
                     json!({
-                        "event": "mcp_credit_debit_skipped",
+                        "event": "mcp_credit_capture_skipped",
                         "request_id": crate::security::current_request_id(),
                         "source_sha256": &source_sha256,
                     })
@@ -224,7 +291,7 @@ impl Server {
                 eprintln!(
                     "{}",
                     json!({
-                        "event": "mcp_credit_debit_failed",
+                        "event": "mcp_credit_capture_failed",
                         "request_id": crate::security::current_request_id(),
                         "source_sha256": &source_sha256,
                         "elapsed_ms": started.elapsed().as_millis(),
@@ -240,65 +307,12 @@ impl Server {
             }
         }
 
-        let cache_key = normalize_fallback_url_key(&url);
-        let fallback_reason = self.fallback_cache.lookup(&cache_key);
-        let data = if let Some(reason) = fallback_reason {
-            eprintln!(
-                "{}",
-                json!({
-                    "event": "mcp_fetch_source_fallback",
-                    "request_id": crate::security::current_request_id(),
-                    "mode": "unblock",
-                    "reason": reason,
-                    "source_sha256": &source_sha256,
-                })
-            );
-            self.fetcher
-                .get_unblock_data_with_receipt_with_auth(&url, Some(&auth_context))
-                .await
-                .map_err(|_| {
-                    eprintln!(
-                        "{}",
-                        json!({
-                            "event": "mcp_fetch_source_failed",
-                            "request_id": crate::security::current_request_id(),
-                            "mode": "unblock",
-                            "source_sha256": &source_sha256,
-                            "elapsed_ms": started.elapsed().as_millis(),
-                        })
-                    );
-                    ErrorData::internal_error("Upstream fetch failed", None)
-                })?
-        } else {
-            match self
-                .fetcher
-                .get_adaptive_data_with_receipt_with_auth(&url, Some(&auth_context))
-                .await
-            {
-                Ok(data) => {
-                    analyze_fetch_data_in_background(
-                        self.fallback_cache.clone(),
-                        cache_key,
-                        data.data.clone(),
-                    );
-                    data
-                }
-                Err(e) => {
-                    analyze_fetch_error_in_background(self.fallback_cache.clone(), cache_key, &e);
-                    eprintln!(
-                        "{}",
-                        json!({
-                            "event": "mcp_fetch_source_failed",
-                            "request_id": crate::security::current_request_id(),
-                            "mode": "fast",
-                            "source_sha256": &source_sha256,
-                            "elapsed_ms": started.elapsed().as_millis(),
-                        })
-                    );
-                    return Err(ErrorData::internal_error("Upstream fetch failed", None));
-                }
-            }
-        };
+        let data = self
+            .fetcher
+            .finalize_fetch_with_receipt(pending, Some(&auth_context))
+            .await
+            .map_err(|_| ErrorData::internal_error("Fetch finalization failed", None))?;
+        analyze_fetch_data_in_background(self.fallback_cache.clone(), cache_key, data.data.clone());
 
         let text = render_fetch_result(&data);
         let executed_mode = data
@@ -880,15 +894,212 @@ impl ServerHandler for Server {}
 #[cfg(test)]
 mod tests {
     use super::{
-        FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Server,
+        FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Params, Server,
         mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
         structured_fetch_result,
     };
-    use crate::auth::ResolverAuth;
     use crate::types::{FetchWithReceipt, Receipt};
-    use axum::{body::to_bytes, http::header};
+    use crate::{auth::ResolverAuth, credits::ResolverCreditsClient, fetch::Fetcher};
+    use axum::{
+        Json, Router,
+        body::to_bytes,
+        extract::State,
+        http::{Request, StatusCode, header},
+        routing::{get, post},
+    };
+    use rmcp::{handler::server::tool::Extension, handler::server::wrapper::Parameters};
     use serde_json::json;
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    #[derive(Clone)]
+    struct McpBoundaryState {
+        auth_calls: Arc<AtomicUsize>,
+        preflight_calls: Arc<AtomicUsize>,
+        capture_calls: Arc<AtomicUsize>,
+        balance: i64,
+    }
+
+    async fn spawn_boundary(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP boundary");
+        let address = listener.local_addr().expect("MCP boundary address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve MCP boundary");
+        });
+        format!("http://{address}")
+    }
+
+    async fn mcp_introspect(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.auth_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "active": true,
+            "scope": "tool:fetch_source",
+            "aud": "https://resolver.api.livylabs.xyz/mcp",
+            "client_id": "mcp-test",
+            "https://claims.livylabs.xyz/tenant_id": "tenant-a",
+            "https://claims.livylabs.xyz/project_id": "project-a"
+        }))
+    }
+
+    async fn mcp_capture(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.capture_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "mode": "captured",
+            "enforced": true,
+            "charged": true,
+            "amount": 1
+        }))
+    }
+
+    async fn mcp_preflight(State(state): State<McpBoundaryState>) -> Json<serde_json::Value> {
+        state.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "tenant_id": "tenant-a",
+            "membership_id": "00000000-0000-0000-0000-000000000001",
+            "balance": state.balance,
+            "lifetime_granted": 10,
+            "lifetime_used": 0,
+            "created_at": "2026-08-17T00:00:00Z",
+            "updated_at": "2026-08-17T00:00:00Z"
+        }))
+    }
+
+    #[tokio::test]
+    async fn mcp_upstream_failure_authenticates_but_never_captures_or_finalizes() {
+        let spider = Router::new().route(
+            "/scrape",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": "upstream unavailable"})),
+                )
+            }),
+        );
+        let spider_base = spawn_boundary(spider).await;
+        let fetcher = Arc::new(Fetcher::for_tests(spider_base, 4096, None));
+        let state = McpBoundaryState {
+            auth_calls: Arc::new(AtomicUsize::new(0)),
+            preflight_calls: Arc::new(AtomicUsize::new(0)),
+            capture_calls: Arc::new(AtomicUsize::new(0)),
+            balance: 10,
+        };
+        let control = Router::new()
+            .route("/oauth/introspect", post(mcp_introspect))
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits",
+                get(mcp_preflight),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits/debits",
+                post(mcp_capture),
+            )
+            .with_state(state.clone());
+        let control_base = spawn_boundary(control).await;
+        let server = Server::new(
+            fetcher.clone(),
+            Arc::new(ResolverAuth::for_test_endpoint(format!(
+                "{control_base}/oauth/introspect"
+            ))),
+            Arc::new(ResolverCreditsClient::for_tests(control_base)),
+            Arc::new(FetchFallbackCache::default()),
+        );
+        let (parts, _) = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer mcp-token")
+            .body(())
+            .expect("MCP request")
+            .into_parts();
+
+        let result = server
+            .fetch_source(
+                Extension(parts),
+                Parameters(Params {
+                    url: "https://example.com".to_string(),
+                    idempotency_key: Some("mcp-request-1".to_string()),
+                }),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.capture_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetcher.receipt_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_insufficient_balance_prevents_spider_and_capture() {
+        let spider_calls = Arc::new(AtomicUsize::new(0));
+        let calls = spider_calls.clone();
+        let spider = Router::new().route(
+            "/scrape",
+            post(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!([{"status": 200, "content": "resolved"}]))
+                }
+            }),
+        );
+        let spider_base = spawn_boundary(spider).await;
+        let fetcher = Arc::new(Fetcher::for_tests(spider_base, 4096, None));
+        let state = McpBoundaryState {
+            auth_calls: Arc::new(AtomicUsize::new(0)),
+            preflight_calls: Arc::new(AtomicUsize::new(0)),
+            capture_calls: Arc::new(AtomicUsize::new(0)),
+            balance: 0,
+        };
+        let control = Router::new()
+            .route("/oauth/introspect", post(mcp_introspect))
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits",
+                get(mcp_preflight),
+            )
+            .route(
+                "/api/v1/tenants/tenant-a/users/me/credits/debits",
+                post(mcp_capture),
+            )
+            .with_state(state.clone());
+        let control_base = spawn_boundary(control).await;
+        let server = Server::new(
+            fetcher.clone(),
+            Arc::new(ResolverAuth::for_test_endpoint(format!(
+                "{control_base}/oauth/introspect"
+            ))),
+            Arc::new(ResolverCreditsClient::for_tests(control_base)),
+            Arc::new(FetchFallbackCache::default()),
+        );
+        let (parts, _) = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer mcp-token")
+            .body(())
+            .expect("MCP request")
+            .into_parts();
+
+        let result = server
+            .fetch_source(
+                Extension(parts),
+                Parameters(Params {
+                    url: "https://example.com".to_string(),
+                    idempotency_key: Some("mcp-request-1".to_string()),
+                }),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(state.auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.preflight_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(spider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.capture_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetcher.receipt_count(), 0);
+    }
 
     #[test]
     fn fetch_source_tool_advertises_oauth_metadata() {

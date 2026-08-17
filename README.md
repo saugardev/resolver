@@ -160,6 +160,21 @@ request when the first response is a recognized browser, JavaScript, robots, or
 human-verification challenge. Both attempts share one deadline and only the
 final successful result can create a receipt or provenance record.
 
+Authenticated requests use this billing order: validate the request, perform a
+non-consuming balance/entitlement preflight, obtain and validate a pending
+Spider result, capture the idempotent credit debit, then create the receipt and
+provenance record and return the result. Insufficient balance therefore prevents
+Spider work, while an upstream HTTP/payload failure, timeout, or oversized body
+cannot produce a captured debit, receipt, or provenance record. A capture
+failure after successful Spider work also prevents finalization.
+
+The current backend does not expose atomic reserve/capture/cancel operations.
+Consequently, the balance can change after preflight, and some valid Spider work
+can be consumed before an authoritative capture loses that race. Closing that
+cost-abuse window requires a backend reservation before Spider, followed by
+capture on success or cancellation on failure; the resolver's current ordering
+is the safest available contract until that backend API exists.
+
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/fetch` | Fetch one URL |
@@ -188,8 +203,10 @@ LIVY_RESOLVER_HSTS_ENABLED=false
 
 Spider calls have a five-second connect timeout, a 65-second client ceiling,
 the request's `timeout_secs` absolute deadline (1–60 seconds), and the response
-limit above. Every non-2xx Spider response maps to an upstream error before
-receipt or provenance creation.
+limit above. Redirect following is disabled, so control-plane 3xx responses are
+errors even when their target would return 2xx. Every non-2xx response and every
+payload item whose source `status` is outside 200–299 maps to an upstream error
+before credit capture, receipt creation, or provenance creation.
 
 Enable HSTS only when the public endpoint is served through HTTPS. The API
 accepts absolute HTTP and HTTPS source URLs, including localhost and private

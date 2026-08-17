@@ -1,8 +1,8 @@
 //! Spider execution layer for product routes and receipts.
 
 use crate::auth::ResolverAuthContext;
-use crate::errors::FetchError;
-use crate::provenance::{ProvenanceClient, ResolverFetchEvidence};
+use crate::errors::{FetchError, ProvenanceError};
+use crate::provenance::{ProvenanceClient, ProvenanceResult, ResolverFetchEvidence};
 use crate::snapshot_upload::SnapshotPayload;
 use crate::types::{
     FetchWithReceipt, FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest,
@@ -18,8 +18,10 @@ use spider_client::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -29,8 +31,30 @@ use tokio::time::Instant;
 const DEFAULT_SPIDER_API_URL: &str = "https://api.spider.cloud";
 const DEFAULT_MAX_UPSTREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UPSTREAM_ERROR_BYTES: usize = 4 * 1024;
+const MAX_UPSTREAM_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 const SPIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SPIDER_CLIENT_TIMEOUT: Duration = Duration::from_secs(65);
+
+pub(crate) type ProvenanceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProvenanceResult, ProvenanceError>> + Send + 'a>>;
+
+pub(crate) trait ProvenanceAttestor: Send + Sync {
+    fn attest_fetch<'a>(
+        &'a self,
+        evidence: ResolverFetchEvidence<'a>,
+        auth_context: Option<&'a ResolverAuthContext>,
+    ) -> ProvenanceFuture<'a>;
+}
+
+impl ProvenanceAttestor for ProvenanceClient {
+    fn attest_fetch<'a>(
+        &'a self,
+        evidence: ResolverFetchEvidence<'a>,
+        auth_context: Option<&'a ResolverAuthContext>,
+    ) -> ProvenanceFuture<'a> {
+        Box::pin(ProvenanceClient::attest_fetch(self, evidence, auth_context))
+    }
+}
 
 /// Resolver-owned Spider transport.
 ///
@@ -64,21 +88,10 @@ impl SpiderTransport {
                 ));
             }
         };
-        let client = Client::builder()
-            .connect_timeout(SPIDER_CONNECT_TIMEOUT)
-            .timeout(SPIDER_CLIENT_TIMEOUT)
-            .build()
-            .map_err(|err| format!("cannot configure Spider HTTP client: {err}"))?;
-
-        Self::new(client, api_key, api_url, max_response_bytes)
+        Self::new(api_key, api_url, max_response_bytes)
     }
 
-    fn new(
-        client: Client,
-        api_key: String,
-        api_url: String,
-        max_response_bytes: usize,
-    ) -> Result<Self, String> {
+    fn new(api_key: String, api_url: String, max_response_bytes: usize) -> Result<Self, String> {
         if max_response_bytes == 0 {
             return Err("Spider response limit must be greater than zero".to_string());
         }
@@ -88,6 +101,12 @@ impl SpiderTransport {
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("SPIDER_API_URL must use http or https".to_string());
         }
+        let client = Client::builder()
+            .connect_timeout(SPIDER_CONNECT_TIMEOUT)
+            .timeout(SPIDER_CLIENT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| format!("cannot configure Spider HTTP client: {err}"))?;
 
         Ok(Self {
             client,
@@ -126,7 +145,7 @@ impl SpiderTransport {
             .json(payload)
             .send()
             .await
-            .map_err(FetchError::UnableFetch)?;
+            .map_err(map_reqwest_error)?;
         let status = response.status();
 
         if !status.is_success() {
@@ -157,7 +176,7 @@ impl SpiderTransport {
 async fn read_success_body(mut response: Response, limit: usize) -> Result<Vec<u8>, FetchError> {
     let mut body =
         Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
-    while let Some(chunk) = response.chunk().await.map_err(FetchError::UnableFetch)? {
+    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
         let next_len = body
             .len()
             .checked_add(chunk.len())
@@ -167,6 +186,14 @@ async fn read_success_body(mut response: Response, limit: usize) -> Result<Vec<u
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn map_reqwest_error(error: reqwest::Error) -> FetchError {
+    if error.is_timeout() || error.is_connect() && error.to_string().contains("timed out") {
+        FetchError::Timeout("Spider transport deadline elapsed".to_string())
+    } else {
+        FetchError::UnableFetch(error)
+    }
 }
 
 async fn read_error_body(mut response: Response) -> String {
@@ -204,9 +231,29 @@ fn parse_spider_body(content_type: &str, body: &[u8]) -> Result<Value, FetchErro
 
 pub struct Fetcher {
     spider: SpiderTransport,
-    provenance: Option<ProvenanceClient>,
+    provenance: Option<Arc<dyn ProvenanceAttestor>>,
     receipts: Mutex<HashMap<String, Receipt>>,
     receipt_counter: AtomicU64,
+}
+
+/// Successfully fetched and validated Spider data that has not yet created a
+/// receipt or provenance record. Callers must capture credits before consuming
+/// this value with `finalize_product_fetch`.
+#[must_use = "pending fetches must be captured and finalized or explicitly discarded"]
+pub struct PendingProductFetch {
+    payload: ProductRequest,
+    route: ProductRoute,
+    executed_mode: ProductMode,
+    data: Value,
+}
+
+impl PendingProductFetch {
+    pub fn source_or_query(&self) -> Option<&str> {
+        self.payload
+            .source
+            .as_deref()
+            .or(self.payload.query.as_deref())
+    }
 }
 
 impl Fetcher {
@@ -220,7 +267,8 @@ impl Fetcher {
         let spider = SpiderTransport::from_env(key)
             .unwrap_or_else(|err| panic!("invalid Spider transport configuration: {err}"));
         let provenance = ProvenanceClient::from_env()
-            .unwrap_or_else(|err| panic!("invalid provenance configuration: {err}"));
+            .unwrap_or_else(|err| panic!("invalid provenance configuration: {err}"))
+            .map(|client| Arc::new(client) as Arc<dyn ProvenanceAttestor>);
         Fetcher {
             spider,
             provenance,
@@ -229,20 +277,46 @@ impl Fetcher {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        api_url: String,
+        max_response_bytes: usize,
+        provenance: Option<Arc<dyn ProvenanceAttestor>>,
+    ) -> Self {
+        Self {
+            spider: SpiderTransport::new("test-key".to_string(), api_url, max_response_bytes)
+                .expect("test Spider transport"),
+            provenance,
+            receipts: Mutex::new(HashMap::new()),
+            receipt_counter: AtomicU64::new(1),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receipt_count(&self) -> usize {
+        self.receipts
+            .lock()
+            .map(|receipts| receipts.len())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub async fn product_fetch(
         &self,
         payload: ProductRequest,
         route: ProductRoute,
     ) -> Result<ProductResponse, FetchError> {
-        self.product_fetch_with_auth(payload, route, None).await
+        let pending = self.prepare_product_fetch(payload, route).await?;
+        self.finalize_product_fetch(pending, None).await
     }
 
-    pub async fn product_fetch_with_auth(
+    /// Execute and validate Spider work without creating any durable/public
+    /// evidence. The caller must successfully capture credits before finalize.
+    pub async fn prepare_product_fetch(
         &self,
         payload: ProductRequest,
         route: ProductRoute,
-        auth_context: Option<&ResolverAuthContext>,
-    ) -> Result<ProductResponse, FetchError> {
+    ) -> Result<PendingProductFetch, FetchError> {
         payload.validate_for(route)?;
         let mode = self.resolve_mode(payload.mode, route);
         let timeout_secs = payload.timeout_secs.unwrap_or(match mode {
@@ -290,8 +364,30 @@ impl Fetcher {
         };
 
         let data = Self::ensure_spider_success(data)?;
+
+        Ok(PendingProductFetch {
+            payload,
+            route,
+            executed_mode,
+            data,
+        })
+    }
+
+    /// Create the receipt and optional provenance only after the caller has
+    /// successfully captured the corresponding credit charge.
+    pub async fn finalize_product_fetch(
+        &self,
+        pending: PendingProductFetch,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<ProductResponse, FetchError> {
+        let PendingProductFetch {
+            payload,
+            route,
+            executed_mode,
+            data,
+        } = pending;
         let should_receipt = payload.receipt.unwrap_or(matches!(
-            mode,
+            payload.mode,
             ProductMode::Auto | ProductMode::Fast | ProductMode::Extract
         ));
         let (receipt_id, receipt) = if should_receipt {
@@ -334,34 +430,12 @@ impl Fetcher {
         })
     }
 
-    pub async fn get_fast_data_with_receipt(
+    pub async fn finalize_fetch_with_receipt(
         &self,
-        source: &str,
-    ) -> Result<FetchWithReceipt, FetchError> {
-        self.get_fast_data_with_receipt_with_auth(source, None)
-            .await
-    }
-
-    pub async fn get_fast_data_with_receipt_with_auth(
-        &self,
-        source: &str,
+        pending: PendingProductFetch,
         auth_context: Option<&ResolverAuthContext>,
     ) -> Result<FetchWithReceipt, FetchError> {
-        self.get_adaptive_data_with_receipt_with_auth(source, auth_context)
-            .await
-    }
-
-    /// Try the fast path and perform one in-deadline unblock fallback before
-    /// creating the final receipt or provenance record.
-    pub async fn get_adaptive_data_with_receipt_with_auth(
-        &self,
-        source: &str,
-        auth_context: Option<&ResolverAuthContext>,
-    ) -> Result<FetchWithReceipt, FetchError> {
-        let payload = ProductRequest::fast(source);
-        let response = self
-            .product_fetch_with_auth(payload, ProductRoute::Scrape, auth_context)
-            .await?;
+        let response = self.finalize_product_fetch(pending, auth_context).await?;
         let crawl = response.data;
         let receipt = response
             .receipt
@@ -376,32 +450,24 @@ impl Fetcher {
         })
     }
 
-    pub async fn get_unblock_data_with_receipt_with_auth(
-        &self,
-        source: &str,
-        auth_context: Option<&ResolverAuthContext>,
-    ) -> Result<FetchWithReceipt, FetchError> {
-        let mut payload = ProductRequest::fast(source);
-        payload.mode = ProductMode::Unblock;
-        payload.receipt = Some(true);
-        let response = self
-            .product_fetch_with_auth(payload, ProductRoute::Unblock, auth_context)
-            .await?;
-        let data = response.data;
-        let receipt = response
-            .receipt
-            .ok_or_else(|| FetchError::Http("receipt was not created".to_string()))?;
-
-        Ok(FetchWithReceipt {
-            receipt_id: receipt.id.clone(),
-            receipt: receipt.clone(),
-            data,
-            provenance: response.provenance,
-            provenance_error: response.provenance_error,
-        })
+    pub fn fast_request(source: &str) -> ProductRequest {
+        ProductRequest::fast(source)
     }
 
-    pub async fn snapshot_with_receipt(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
+    pub fn unblock_request(source: &str, receipt: bool) -> ProductRequest {
+        let mut payload = ProductRequest::fast(source);
+        payload.mode = ProductMode::Unblock;
+        payload.timeout_secs = Some(50);
+        payload.request_timeout_secs = Some(30);
+        payload.crawl_timeout_secs = Some(45);
+        payload.stealth = Some(true);
+        payload.fingerprint = Some(true);
+        payload.scroll = Some(1);
+        payload.receipt = Some(receipt);
+        payload
+    }
+
+    pub async fn prepare_snapshot(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
         let formats = HashSet::from([ReturnFormat::Raw, ReturnFormat::Screenshot]);
         let params = RequestParams {
             return_format: Some(ReturnFormatHandling::Multi(formats)),
@@ -419,21 +485,6 @@ impl Fetcher {
         let crawl = Self::ensure_spider_success(Self::normalize_value(data)?)?;
 
         SnapshotPayload::from_spider_response(source, crawl).map_err(FetchError::Snapshot)
-    }
-
-    pub async fn unblocker(&self, source: &str) -> Result<serde_json::Value, FetchError> {
-        let mut payload = ProductRequest::fast(source);
-        payload.mode = ProductMode::Unblock;
-        payload.timeout_secs = Some(50);
-        payload.request_timeout_secs = Some(30);
-        payload.crawl_timeout_secs = Some(45);
-        payload.stealth = Some(true);
-        payload.fingerprint = Some(true);
-        payload.scroll = Some(1);
-        payload.receipt = Some(false);
-        self.product_fetch(payload, ProductRoute::Unblock)
-            .await
-            .map(|response| response.data)
     }
 
     async fn provenance_for(
@@ -847,31 +898,93 @@ impl Fetcher {
     }
 
     fn ensure_spider_success(value: Value) -> Result<Value, FetchError> {
+        if value.as_array().is_some_and(Vec::is_empty) {
+            return Err(FetchError::Upstream(
+                "Spider returned an empty result set".to_string(),
+            ));
+        }
         let values: Box<dyn Iterator<Item = &Value> + '_> = match value.as_array() {
             Some(items) => Box::new(items.iter()),
             None => Box::new(std::iter::once(&value)),
         };
 
         for item in values {
-            let status = item.get("status").and_then(Value::as_i64);
+            let Some(object) = item.as_object() else {
+                return Err(FetchError::Upstream(
+                    "Spider returned a structurally ambiguous payload".to_string(),
+                ));
+            };
+            let status = object.get("status").and_then(spider_payload_status);
             let success = item.get("success").and_then(Value::as_bool);
-            let error = item.get("error").and_then(|error| match error {
+            if object.contains_key("status") && status.is_none()
+                || object.contains_key("success") && success.is_none()
+            {
+                return Err(FetchError::UpstreamPayload {
+                    status,
+                    error: Some("Spider returned an invalid success marker".to_string()),
+                    content: None,
+                });
+            }
+            let error = object.get("error").and_then(|error| match error {
                 Value::Null => None,
                 Value::Bool(false) => None,
                 Value::String(message) if message.trim().is_empty() => None,
                 Value::Array(items) if items.is_empty() => None,
                 Value::Object(fields) if fields.is_empty() => None,
-                Value::String(message) => Some(message.clone()),
-                other => Some(other.to_string()),
+                Value::String(message) => Some(bounded_diagnostic(message)),
+                other => Some(bounded_diagnostic(&other.to_string())),
             });
+            let message = object
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .map(bounded_diagnostic);
+            let content = object
+                .get("content")
+                .filter(|content| !content.is_null())
+                .map(|content| match content {
+                    Value::String(content) => bounded_diagnostic(content),
+                    other => bounded_diagnostic(&other.to_string()),
+                });
 
-            if matches!(status, Some(0) | Some(400..=599))
+            if status.is_some_and(|status| !(200..=299).contains(&status))
                 || matches!(success, Some(false))
                 || error.is_some()
             {
-                return Err(FetchError::Upstream(error.unwrap_or_else(|| {
-                    "Spider returned an unsuccessful fetch status".to_string()
-                })));
+                return Err(FetchError::UpstreamPayload {
+                    status,
+                    error: error.or(message),
+                    content,
+                });
+            }
+
+            let explicit_success = status.is_some_and(|status| (200..=299).contains(&status))
+                || matches!(success, Some(true));
+            let recognizable_output = object.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "content"
+                        | "data"
+                        | "results"
+                        | "items"
+                        | "links"
+                        | "urls"
+                        | "screenshot"
+                        | "raw"
+                        | "html"
+                        | "url"
+                        | "title"
+                        | "description"
+                )
+            });
+            if !explicit_success && !recognizable_output {
+                return Err(FetchError::UpstreamPayload {
+                    status,
+                    error: message.or_else(|| {
+                        Some("Spider returned a structurally ambiguous payload".to_string())
+                    }),
+                    content,
+                });
             }
         }
 
@@ -950,10 +1063,31 @@ impl Fetcher {
     }
 }
 
+fn spider_payload_status(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|status| status.parse().ok()))
+}
+
+fn bounded_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_UPSTREAM_DIAGNOSTIC_BYTES {
+        return value.to_string();
+    }
+    let end = (0..=MAX_UPSTREAM_DIAGNOSTIC_BYTES)
+        .rev()
+        .find(|index| value.is_char_boundary(*index))
+        .unwrap_or(0);
+    value[..end].to_string()
+}
+
 pub(crate) fn fallback_reason_for_fetch_error(error: &FetchError) -> Option<&'static str> {
     match error {
         FetchError::Upstream(detail) => fallback_reason_for_text(detail),
         FetchError::UpstreamStatus { body, .. } => fallback_reason_for_text(body),
+        FetchError::UpstreamPayload { error, content, .. } => error
+            .as_deref()
+            .and_then(fallback_reason_for_text)
+            .or_else(|| content.as_deref().and_then(fallback_reason_for_text)),
         _ => None,
     }
 }
@@ -1068,9 +1202,13 @@ mod tests {
         Json, Router,
         body::Body,
         http::{Response as HttpResponse, StatusCode},
-        routing::post,
+        routing::{any, post},
     };
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     async fn spawn_mock(router: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1086,19 +1224,7 @@ mod tests {
     }
 
     fn test_fetcher(api_url: String, max_response_bytes: usize) -> Fetcher {
-        let transport = SpiderTransport::new(
-            Client::builder().build().expect("test HTTP client"),
-            "test-key".to_string(),
-            api_url,
-            max_response_bytes,
-        )
-        .expect("test Spider transport");
-        Fetcher {
-            spider: transport,
-            provenance: None,
-            receipts: Mutex::new(HashMap::new()),
-            receipt_counter: AtomicU64::new(1),
-        }
+        Fetcher::for_tests(api_url, max_response_bytes, None)
     }
 
     #[tokio::test]
@@ -1139,7 +1265,7 @@ mod tests {
         }
 
         let snapshot_error = fetcher
-            .snapshot_with_receipt("https://example.com")
+            .prepare_snapshot("https://example.com")
             .await
             .expect_err("snapshot HTTP 500 must fail");
         assert!(matches!(
@@ -1186,13 +1312,9 @@ mod tests {
                 Json(json!({"status": 200}))
             }),
         );
-        let transport = SpiderTransport::new(
-            Client::new(),
-            "test-key".to_string(),
-            spawn_mock(router).await,
-            1024,
-        )
-        .expect("test transport");
+        let transport =
+            SpiderTransport::new("test-key".to_string(), spawn_mock(router).await, 1024)
+                .expect("test transport");
 
         let error = transport
             .post(
@@ -1267,6 +1389,128 @@ mod tests {
         assert_eq!(fetcher.receipts.lock().expect("receipts").len(), 1);
     }
 
+    #[tokio::test]
+    async fn payload_status_failure_preserves_content_for_one_current_request_fallback() {
+        let scrape_calls = Arc::new(AtomicUsize::new(0));
+        let unblock_calls = Arc::new(AtomicUsize::new(0));
+        let scrape_counter = scrape_calls.clone();
+        let unblock_counter = unblock_calls.clone();
+        let router = Router::new()
+            .route(
+                "/scrape",
+                post(move || {
+                    let calls = scrape_counter.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Json(json!([{
+                            "status": 403,
+                            "content": "captcha verification required"
+                        }]))
+                    }
+                }),
+            )
+            .route(
+                "/unblocker",
+                post(move || {
+                    let calls = unblock_counter.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Json(json!([{"status": 200, "content": "resolved"}]))
+                    }
+                }),
+            );
+        let fetcher = test_fetcher(spawn_mock(router).await, 4096);
+
+        let pending = fetcher
+            .prepare_product_fetch(
+                ProductRequest::fast("https://example.com"),
+                ProductRoute::Scrape,
+            )
+            .await
+            .expect("payload challenge should be rescued");
+        assert_eq!(fetcher.receipt_count(), 0);
+        let response = fetcher
+            .finalize_product_fetch(pending, None)
+            .await
+            .expect("finalize rescued response");
+
+        assert_eq!(response.mode, ProductMode::Unblock);
+        assert_eq!(response.data[0]["content"], "resolved");
+        assert_eq!(scrape_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(unblock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fetcher.receipt_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirect_statuses_are_not_followed_to_success() {
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let target_calls = Arc::new(AtomicUsize::new(0));
+            let target_counter = target_calls.clone();
+            let router = Router::new()
+                .route(
+                    "/scrape",
+                    post(move || async move {
+                        HttpResponse::builder()
+                            .status(status)
+                            .header(header::LOCATION, "/redirect-target")
+                            .body(Body::empty())
+                            .expect("redirect response")
+                    }),
+                )
+                .route(
+                    "/redirect-target",
+                    any(move || {
+                        let calls = target_counter.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Json(json!([{"status": 200, "content": "must not run"}]))
+                        }
+                    }),
+                );
+            let fetcher = test_fetcher(spawn_mock(router).await, 4096);
+            let mut request = ProductRequest::legacy("https://example.com");
+            request.mode = ProductMode::Raw;
+            request.receipt = Some(true);
+
+            let error = fetcher
+                .prepare_product_fetch(request, ProductRoute::Scrape)
+                .await
+                .err()
+                .expect("redirect must fail");
+            assert!(matches!(
+                error,
+                FetchError::UpstreamStatus { status: actual, .. } if actual == status
+            ));
+            assert_eq!(target_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fetcher.receipt_count(), 0);
+        }
+    }
+
+    #[test]
+    fn ambiguous_success_objects_are_rejected() {
+        let error = Fetcher::ensure_spider_success(json!({
+            "message": "upstream unavailable"
+        }))
+        .expect_err("message-only object is ambiguous");
+        assert!(matches!(error, FetchError::UpstreamPayload { .. }));
+
+        for ambiguous in [
+            json!([]),
+            json!({"status": "okay", "content": "data"}),
+            json!({"success": "true", "content": "data"}),
+        ] {
+            assert!(
+                Fetcher::ensure_spider_success(ambiguous).is_err(),
+                "ambiguous success marker must fail"
+            );
+        }
+    }
+
     #[test]
     fn proxy_contract_uses_only_the_current_spider_field() {
         let fetcher = test_fetcher("http://127.0.0.1:1".to_string(), 1024);
@@ -1288,6 +1532,6 @@ mod tests {
         ]))
         .expect_err("partial failure must not look successful");
 
-        assert!(matches!(error, FetchError::Upstream(_)));
+        assert!(matches!(error, FetchError::UpstreamPayload { .. }));
     }
 }

@@ -22,6 +22,12 @@ pub enum FetchError {
     Upstream(String),
     #[error("Upstream fetch returned HTTP {status}")]
     UpstreamStatus { status: StatusCode, body: String },
+    #[error("Upstream payload reported a failed fetch")]
+    UpstreamPayload {
+        status: Option<i64>,
+        error: Option<String>,
+        content: Option<String>,
+    },
     #[error("Upstream response exceeded {limit} bytes")]
     UpstreamResponseTooLarge { limit: usize },
     #[error("Fetch timed out")]
@@ -71,11 +77,16 @@ pub enum ResolverCreditsError {
     Http(reqwest::Error),
     #[error("credit request returned {status}: {}", compact_body(body))]
     Backend { status: StatusCode, body: String },
+    #[error("insufficient user credits: {available} available, {required} required")]
+    InsufficientCredits { available: i64, required: i64 },
+    #[error("credit capture was not applied: {0}")]
+    CaptureNotApplied(String),
 }
 
 impl ResolverCreditsError {
     pub fn is_payment_required(&self) -> bool {
         match self {
+            Self::InsufficientCredits { .. } => true,
             Self::Backend { status, body } => {
                 *status == StatusCode::PAYMENT_REQUIRED
                     || backend_error_code(body).as_deref() == Some("insufficient_user_credits")
@@ -118,7 +129,8 @@ impl IntoResponse for FetchError {
         let (status, code, message) = match self {
             FetchError::UnableFetch(_)
             | FetchError::Upstream(_)
-            | FetchError::UpstreamStatus { .. } => (
+            | FetchError::UpstreamStatus { .. }
+            | FetchError::UpstreamPayload { .. } => (
                 StatusCode::BAD_GATEWAY,
                 "upstream_fetch_failed",
                 "Upstream fetch failed".to_string(),
