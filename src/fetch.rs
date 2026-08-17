@@ -10,8 +10,8 @@ use crate::types::{
 };
 use serde_json::Value;
 use spider_client::{
-    CSSSelector, Delay, Engine, IdleNetwork, ProxyType, RequestParams, RequestType, ReturnFormat,
-    ReturnFormatHandling, SearchRequestParams, Selector, Spider, Timeout, WaitFor,
+    CSSSelector, Delay, Engine, IdleNetwork, ProxyType, RedirectPolicy, RequestParams, RequestType,
+    ReturnFormat, ReturnFormatHandling, SearchRequestParams, Selector, Spider, Timeout, WaitFor,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -206,6 +206,7 @@ impl Fetcher {
             stealth: Some(true),
             fingerprint: Some(true),
             proxy_enabled: Some(true),
+            redirect_policy: Some(RedirectPolicy::Strict),
             ..Default::default()
         };
 
@@ -430,6 +431,7 @@ impl Fetcher {
             return_format: Some(Self::return_format(payload, mode)),
             proxy: Self::proxy_type(payload, mode),
             proxy_enabled: Some(matches!(mode, ProductMode::Unblock)),
+            redirect_policy: Some(RedirectPolicy::Strict),
             limit: payload.limit,
             depth: payload.depth,
             cache: payload.cache,

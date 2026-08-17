@@ -1,6 +1,6 @@
 //! Request correlation, safe access logs, timeouts, and response hardening.
 
-use crate::config::SecurityConfig;
+use crate::config::{McpRuntimeConfig, SecurityConfig};
 use axum::{
     Json,
     body::Body,
@@ -15,12 +15,17 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio_util::sync::CancellationToken;
 
 tokio::task_local! {
     static REQUEST_ID: String;
 }
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Cooperative cancellation inserted before RMCP detaches stateless request handling.
+#[derive(Clone, Debug)]
+pub struct McpRequestCancellation(pub CancellationToken);
 
 pub fn current_request_id() -> Option<String> {
     REQUEST_ID.try_with(Clone::clone).ok()
@@ -85,12 +90,26 @@ pub async fn product_timeout(
 
 pub async fn mcp_timeout(
     State(config): State<SecurityConfig>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match tokio::time::timeout(config.mcp_timeout, next.run(request)).await {
-        Ok(response) => response,
-        Err(_) => (
+    let cancellation = CancellationToken::new();
+    request
+        .extensions_mut()
+        .insert(McpRequestCancellation(cancellation.clone()));
+    let request = next.run(request);
+    tokio::pin!(request);
+    let deadline = tokio::time::sleep(config.mcp_timeout);
+    tokio::pin!(deadline);
+
+    tokio::select! {
+        response = &mut request => response,
+        () = &mut deadline => {
+            // The production MCP tool observes this token around its entire operation. Wait for
+            // its terminal response so debit/fetch/receipt/provenance work cannot outlive 504.
+            cancellation.cancel();
+            let _terminal_response = request.await;
+            (
             StatusCode::GATEWAY_TIMEOUT,
             Json(json!({
                 "error": "MCP request timed out",
@@ -98,7 +117,37 @@ pub async fn mcp_timeout(
                 "request_id": current_request_id(),
             })),
         )
-            .into_response(),
+                .into_response()
+        },
+    }
+}
+
+/// RMCP accepts a configured origin with no port as a wildcard. Enforce the exact effective
+/// origin tuple before the transport sees the request.
+pub async fn exact_mcp_origin(
+    State(config): State<McpRuntimeConfig>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(origin) = request.headers().get(header::ORIGIN) else {
+        return next.run(request).await;
+    };
+    let allowed = origin
+        .to_str()
+        .ok()
+        .is_some_and(|origin| config.allows_origin(origin));
+    if allowed {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "MCP Origin is not allowed",
+                "code": "mcp_origin_forbidden",
+                "request_id": current_request_id(),
+            })),
+        )
+            .into_response()
     }
 }
 

@@ -1,26 +1,33 @@
 //! Default-deny source egress checks.
 //!
-//! Spider performs the final fetch, but validating every explicit source here prevents callers
-//! from using the resolver as a route to loopback, private, link-local, or metadata services.
-//! Every address in a DNS answer is checked on every request so mixed-answer and rebinding-style
-//! responses fail closed.
+//! Spider performs the final fetch in separate infrastructure, so local DNS validation is only
+//! defense in depth. Actual fetching remains disabled unless an operator explicitly attests that
+//! the selected Spider deployment (or its policy proxy) enforces destination policy across DNS
+//! resolution and redirects, and its bounded readiness probe succeeds.
 
 use crate::{
     config::{env_bool, env_u64},
     errors::FetchError,
     types::validate_source_url,
 };
+use antissrf::{AntiSSRFPolicy, PolicyConfigOptions};
 use std::{collections::HashSet, net::IpAddr, time::Duration};
 use tokio::net::lookup_host;
 use url::{Host, Url};
 
 const DEFAULT_DNS_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_CAPABILITY_TIMEOUT_SECS: u64 = 3;
+pub const SPIDER_EGRESS_ATTESTATION: &str = "spider-egress-policy-v1";
 
 #[derive(Clone, Debug)]
 pub struct EgressPolicy {
     allow_private_sources: bool,
     trusted_hosts: HashSet<String>,
     dns_timeout: Duration,
+    capability_readiness_url: Option<Url>,
+    capability_client: reqwest::Client,
+    #[cfg(test)]
+    capability_override: Option<bool>,
 }
 
 impl EgressPolicy {
@@ -39,6 +46,33 @@ impl EgressPolicy {
                 })
             );
         }
+        let attestation = std::env::var("LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION").ok();
+        if let Some(value) = attestation.as_deref()
+            && value.trim() != SPIDER_EGRESS_ATTESTATION
+        {
+            return Err(format!(
+                "LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION must equal `{SPIDER_EGRESS_ATTESTATION}`"
+            ));
+        }
+        let readiness_url = std::env::var("LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL")
+            .ok()
+            .map(|value| parse_readiness_url(&value))
+            .transpose()?;
+        if attestation.is_some() != readiness_url.is_some() {
+            return Err(
+                "LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION and LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL must be configured together"
+                    .into(),
+            );
+        }
+        let capability_timeout = Duration::from_secs(env_u64(
+            "LIVY_RESOLVER_SPIDER_EGRESS_READINESS_TIMEOUT_SECS",
+            DEFAULT_CAPABILITY_TIMEOUT_SECS,
+        )?);
+        let capability_client = reqwest::Client::builder()
+            .timeout(capability_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| format!("cannot build Spider readiness client: {err}"))?;
         Ok(Self {
             allow_private_sources,
             trusted_hosts,
@@ -46,11 +80,50 @@ impl EgressPolicy {
                 "LIVY_RESOLVER_DNS_TIMEOUT_SECS",
                 DEFAULT_DNS_TIMEOUT_SECS,
             )?),
+            capability_readiness_url: readiness_url,
+            capability_client,
+            #[cfg(test)]
+            capability_override: None,
         })
     }
 
-    /// Validate syntax, the literal host, and every currently resolved address.
+    /// Validate the local destination and verify the actual-fetch enforcement capability.
     pub async fn validate_source(&self, source: &str) -> Result<(), FetchError> {
+        self.validate_source_preflight(source).await?;
+        self.require_actual_fetch_capability().await
+    }
+
+    /// Probe the operator-attested enforcement point. This is required before every debit/fetch.
+    pub async fn require_actual_fetch_capability(&self) -> Result<(), FetchError> {
+        #[cfg(test)]
+        if let Some(ready) = self.capability_override {
+            return if ready {
+                Ok(())
+            } else {
+                Err(capability_unavailable("test capability is unavailable"))
+            };
+        }
+
+        let url = self.capability_readiness_url.as_ref().ok_or_else(|| {
+            capability_unavailable("operator egress attestation is not configured")
+        })?;
+        let response = self
+            .capability_client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|err| capability_unavailable(&format!("readiness probe failed: {err}")))?;
+        if !response.status().is_success() {
+            return Err(capability_unavailable(&format!(
+                "readiness probe returned {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate syntax, the literal host, and every currently resolved address locally.
+    async fn validate_source_preflight(&self, source: &str) -> Result<(), FetchError> {
         validate_source_url(source)?;
         let parsed = Url::parse(source)
             .map_err(|_| FetchError::BadRequest("`source` must be a valid absolute URL".into()))?;
@@ -86,7 +159,7 @@ impl EgressPolicy {
     }
 
     #[cfg(test)]
-    fn for_tests(trusted_hosts: &[&str]) -> Self {
+    pub(crate) fn for_tests(trusted_hosts: &[&str], capability_ready: bool) -> Self {
         Self {
             allow_private_sources: false,
             trusted_hosts: trusted_hosts
@@ -94,8 +167,28 @@ impl EgressPolicy {
                 .map(|host| normalize_host(host))
                 .collect(),
             dns_timeout: Duration::from_millis(100),
+            capability_readiness_url: None,
+            capability_client: reqwest::Client::new(),
+            capability_override: Some(capability_ready),
         }
     }
+}
+
+fn parse_readiness_url(value: &str) -> Result<Url, String> {
+    let parsed = Url::parse(value.trim()).map_err(|_| {
+        "LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL must be an absolute URL".to_string()
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(
+            "LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL must be http(s), include a host, and omit credentials"
+                .into(),
+        );
+    }
+    Ok(parsed)
 }
 
 fn parse_hosts(value: &str) -> HashSet<String> {
@@ -138,40 +231,28 @@ fn blocked_source() -> FetchError {
     FetchError::BadRequest("`source` must resolve only to public network addresses".into())
 }
 
+fn capability_unavailable(detail: &str) -> FetchError {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "spider_egress_capability_unavailable",
+            "detail": detail,
+        })
+    );
+    FetchError::EgressUnavailable(detail.to_string())
+}
+
 fn is_public_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let [a, b, c, d] = address.octets();
-            !(a == 0
-                || a == 10
-                || a == 127
-                || (a == 100 && (64..=127).contains(&b))
-                || (a == 169 && b == 254)
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 0 && c == 0)
-                || (a == 192 && b == 0 && c == 2)
-                || (a == 192 && b == 88 && c == 99)
-                || (a == 192 && b == 168)
-                || (a == 198 && (b == 18 || b == 19))
-                || (a == 198 && b == 51 && c == 100)
-                || (a == 203 && b == 0 && c == 113)
-                || a >= 224
-                || (a == 255 && b == 255 && c == 255 && d == 255))
-        }
-        IpAddr::V6(address) => {
-            let octets = address.octets();
-            if let Some(embedded) = address.to_ipv4() {
-                return is_public_ip(IpAddr::V4(embedded));
-            }
-            !(address.is_unspecified()
-                || address.is_loopback()
-                || (octets[0] & 0xfe) == 0xfc
-                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
-                || octets[0] == 0xff
-                || (octets[0..4] == [0x20, 0x01, 0x0d, 0xb8])
-                || (octets[0..8] == [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]))
-        }
+    if let IpAddr::V6(address) = address
+        && let Some(embedded) = address.to_ipv4()
+    {
+        return is_public_ip(IpAddr::V4(embedded));
     }
+    let address = address.to_string();
+    let mut policy = AntiSSRFPolicy::new(PolicyConfigOptions::ExternalOnlyLatest);
+    policy
+        .is_network_connection_allowed(&[address.as_str()])
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -205,8 +286,14 @@ mod tests {
             "::1",
             "fc00::1",
             "fe80::1",
+            "fec0::1",
+            "64:ff9b::1",
+            "64:ff9b:1::1",
+            "2001:2::1",
+            "2001:20::1",
             "2001:db8::1",
             "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
         ] {
             let address = address.parse().expect("test address");
             assert!(!is_public_ip(IpAddr::V6(address)), "{address}");
@@ -231,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn literal_and_metadata_sources_are_rejected() {
-        let policy = EgressPolicy::for_tests(&[]);
+        let policy = EgressPolicy::for_tests(&[], true);
         assert!(
             policy
                 .validate_source("http://127.0.0.1/admin")
@@ -254,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_trusted_host_override_is_narrow() {
-        let policy = EgressPolicy::for_tests(&["internal.example"]);
+        let policy = EgressPolicy::for_tests(&["internal.example"], true);
         assert!(
             policy
                 .validate_source("http://internal.example/private")
@@ -267,5 +354,15 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn actual_fetch_capability_is_default_deny() {
+        let policy = EgressPolicy::for_tests(&["example.com"], false);
+        let error = policy
+            .validate_source("https://example.com/")
+            .await
+            .expect_err("missing capability must refuse the fetch");
+        assert!(matches!(error, FetchError::EgressUnavailable(_)));
     }
 }

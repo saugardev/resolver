@@ -9,13 +9,14 @@ default = ["mcp"]
 mcp = []
 
 [dependencies]
+antissrf = { version = "0.1.1", default-features = false }
 axum = {version = "0.8.9" , features = ["macros"]}
 dotenvy = "0.15.7"
 hex = "0.4.3"
 livy-tee = { version = "0.1.1" , features = ["ita-verify"]}
 livy-provenance-sdk = { path = "../livy-core/packages/provenance-sdk" }
 reqwest = "0.12.28"
-rmcp = {version ="1.7.0", features = ["server", "transport-streamable-http-server"]}
+rmcp = {version ="3.1.2", features = ["server", "transport-streamable-http-server"]}
 serde = {version = "1.0.228" , features = ["derive"]}
 serde_json = "1.0.149"
 sha2 = "0.10.9"

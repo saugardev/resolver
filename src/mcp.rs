@@ -19,7 +19,7 @@ use rmcp::{
     ErrorData, ServerHandler,
     handler::server::tool::Extension,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, Meta},
+    model::{CallToolResult, ContentBlock as Content, MetaObject as Meta},
     schemars, tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
@@ -29,6 +29,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source"];
 const FETCH_SOURCE_TITLE: &str = "Fetch Source";
@@ -163,10 +164,31 @@ impl Server {
     async fn fetch_source(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(Params {
+        Parameters(params): Parameters<Params>,
+        rmcp_cancellation: CancellationToken,
+    ) -> Result<CallToolResult, ErrorData> {
+        let deadline_cancellation = parts
+            .extensions
+            .get::<crate::security::McpRequestCancellation>()
+            .map(|cancellation| cancellation.0.clone())
+            .unwrap_or_default();
+        tokio::select! {
+            biased;
+            () = deadline_cancellation.cancelled() => Err(request_cancelled()),
+            () = rmcp_cancellation.cancelled() => Err(request_cancelled()),
+            result = self.fetch_source_operation(parts, params) => result,
+        }
+    }
+}
+
+impl Server {
+    async fn fetch_source_operation(
+        &self,
+        parts: Parts,
+        Params {
             url,
             idempotency_key,
-        }): Parameters<Params>,
+        }: Params,
     ) -> Result<CallToolResult, ErrorData> {
         let auth_context = match require_oauth_context(&self.auth, &parts)? {
             Ok(context) => context,
@@ -286,19 +308,11 @@ impl Server {
                 .await
             {
                 Ok(data) => {
-                    analyze_fetch_data_in_background(
-                        self.fallback_cache.clone(),
-                        cache_key,
-                        data.data.clone(),
-                    );
+                    analyze_fetch_data(self.fallback_cache.clone(), cache_key, data.data.clone());
                     data
                 }
                 Err(e) => {
-                    analyze_fetch_error_in_background(
-                        self.fallback_cache.clone(),
-                        cache_key,
-                        e.to_string(),
-                    );
+                    analyze_fetch_error(self.fallback_cache.clone(), cache_key, e.to_string());
                     eprintln!(
                         "{}",
                         json!({
@@ -330,6 +344,10 @@ impl Server {
         result.content = vec![Content::text(text)];
         Ok(result)
     }
+}
+
+fn request_cancelled() -> ErrorData {
+    ErrorData::internal_error("MCP request cancelled", None)
 }
 
 fn public_validation_message(error: &crate::errors::FetchError) -> &str {
@@ -488,6 +506,12 @@ async fn mirror_tools_list_response_security_schemes(response: Response) -> Resp
 }
 
 fn enrich_tools_list_response_for_chatgpt(body: &str) -> (String, bool) {
+    if let Ok(mut value) = serde_json::from_str::<Value>(body)
+        && enrich_tools_list_payload_for_chatgpt(&mut value)
+    {
+        return (value.to_string(), true);
+    }
+
     let mut changed = false;
     let mut rewritten = String::with_capacity(body.len());
 
@@ -503,7 +527,7 @@ fn enrich_tools_list_response_for_chatgpt(body: &str) -> (String, bool) {
             continue;
         };
 
-        if enrich_tools_list_message_for_chatgpt(&mut value) {
+        if enrich_tools_list_payload_for_chatgpt(&mut value) {
             changed = true;
             rewritten.push_str("data: ");
             rewritten.push_str(&value.to_string());
@@ -514,6 +538,15 @@ fn enrich_tools_list_response_for_chatgpt(body: &str) -> (String, bool) {
     }
 
     (rewritten, changed)
+}
+
+fn enrich_tools_list_payload_for_chatgpt(payload: &mut Value) -> bool {
+    match payload {
+        Value::Array(messages) => messages.iter_mut().fold(false, |changed, message| {
+            enrich_tools_list_message_for_chatgpt(message) || changed
+        }),
+        message => enrich_tools_list_message_for_chatgpt(message),
+    }
 }
 
 fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
@@ -807,36 +840,32 @@ fn extracted_content(data: &Value) -> Option<&str> {
         .find_map(|item| item.get("content").and_then(Value::as_str))
 }
 
-fn analyze_fetch_data_in_background(cache: Arc<FetchFallbackCache>, key: String, data: Value) {
-    tokio::spawn(async move {
-        if let Some(reason) = fallback_reason_for_fetch_data(&data) {
-            eprintln!(
-                "{}",
-                json!({
-                    "event": "mcp_fetch_source_fallback_flag",
-                    "reason": reason,
-                    "source_sha256": crate::security::sensitive_hash(&key),
-                })
-            );
-            cache.flag(key, reason);
-        }
-    });
+fn analyze_fetch_data(cache: Arc<FetchFallbackCache>, key: String, data: Value) {
+    if let Some(reason) = fallback_reason_for_fetch_data(&data) {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "mcp_fetch_source_fallback_flag",
+                "reason": reason,
+                "source_sha256": crate::security::sensitive_hash(&key),
+            })
+        );
+        cache.flag(key, reason);
+    }
 }
 
-fn analyze_fetch_error_in_background(cache: Arc<FetchFallbackCache>, key: String, error: String) {
-    tokio::spawn(async move {
-        if let Some(reason) = fallback_reason_for_text(&error) {
-            eprintln!(
-                "{}",
-                json!({
-                    "event": "mcp_fetch_source_fallback_flag",
-                    "reason": reason,
-                    "source_sha256": crate::security::sensitive_hash(&key),
-                })
-            );
-            cache.flag(key, reason);
-        }
-    });
+fn analyze_fetch_error(cache: Arc<FetchFallbackCache>, key: String, error: String) {
+    if let Some(reason) = fallback_reason_for_text(&error) {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "mcp_fetch_source_fallback_flag",
+                "reason": reason,
+                "source_sha256": crate::security::sensitive_hash(&key),
+            })
+        );
+        cache.flag(key, reason);
+    }
 }
 
 fn fallback_reason_for_fetch_data(data: &Value) -> Option<&'static str> {

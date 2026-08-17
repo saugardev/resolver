@@ -174,25 +174,48 @@ these deployment safety limits with:
 LIVY_RESOLVER_MAX_PRODUCT_BODY_BYTES=65536
 LIVY_RESOLVER_PRODUCT_TIMEOUT_SECS=65
 LIVY_RESOLVER_MCP_TIMEOUT_SECS=65
+LIVY_RESOLVER_SHUTDOWN_GRACE_SECS=10
 LIVY_RESOLVER_HSTS_ENABLED=false
 LIVY_RESOLVER_DNS_TIMEOUT_SECS=3
 LIVY_RESOLVER_ALLOW_PRIVATE_SOURCES=false
+# Required in production before any Spider-backed source operation is accepted:
+LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION=spider-egress-policy-v1
+LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL=https://spider-policy.example/readyz
+LIVY_RESOLVER_SPIDER_EGRESS_READINESS_TIMEOUT_SECS=3
 ```
 
 Enable HSTS only when the public endpoint is served through HTTPS. The API
 accepts absolute HTTP and HTTPS source URLs that resolve exclusively to public
 addresses. Literal and DNS-resolved loopback, private, carrier-grade NAT,
-link-local, documentation, multicast, reserved, and cloud-metadata destinations
-are rejected before credit debit. Mixed public/private DNS answers also fail
-closed and DNS is checked on every request. For a trusted internal deployment,
-prefer the narrow `LIVY_RESOLVER_TRUSTED_SOURCE_HOSTS` allow-list. The broader
-`LIVY_RESOLVER_ALLOW_PRIVATE_SOURCES=true` override disables this boundary and
-must not be used on an internet-facing resolver. Network egress controls remain
-required to constrain redirects performed by the Spider service.
+link-local, documentation, benchmarking, transition, multicast, reserved,
+IPv4-embedded metadata, and cloud-metadata destinations are rejected before
+credit debit. Mixed public/private DNS answers also fail closed and local DNS is
+checked on every request.
 
-`/healthz` is process liveness. `/readyz` returns 200 only after dependencies
-are configured and the listener is accepting work; it switches to 503 before
-graceful shutdown drains requests and cancels MCP work.
+Those local checks cannot bind the address used by the remote Spider service.
+Consequently, all Spider-backed operations (including search) fail with 503 by
+default. Production must set the exact
+`LIVY_RESOLVER_SPIDER_EGRESS_ATTESTATION=spider-egress-policy-v1` value and a
+bounded `LIVY_RESOLVER_SPIDER_EGRESS_READINESS_URL`. This is an operator
+attestation—not automatic discovery—that the selected Spider deployment or
+policy proxy rejects non-public initial destinations, DNS changes, and every
+redirect target. The resolver explicitly requests Spider's strict redirect
+policy, disables redirects on the readiness probe, and requires a successful
+probe before every debit/fetch. Keep the policy at the infrastructure egress
+point where the actual connection is made.
+
+For a trusted internal deployment, the narrow
+`LIVY_RESOLVER_TRUSTED_SOURCE_HOSTS` allow-list bypasses only the local
+preflight. The broader `LIVY_RESOLVER_ALLOW_PRIVATE_SOURCES=true` override also
+affects only local preflight. Neither bypasses the remote enforcement
+attestation/readiness requirement, and neither should be used on an
+internet-facing resolver without a separately reviewed egress policy.
+
+`/healthz` is process liveness. `/readyz` performs the bounded Spider egress
+capability probe and returns 200 only while it succeeds and the listener accepts
+work. It switches to 503 before graceful shutdown drains requests and cancels
+MCP work. Shutdown is hard-bounded by
+`LIVY_RESOLVER_SHUTDOWN_GRACE_SECS` (10 seconds by default).
 
 Errors retain the existing top-level `error` string and add stable `code` and
 `request_id` fields. Responses include `x-request-id`; logs are JSON objects
@@ -218,8 +241,8 @@ rejections, and gateway 429 responses. Do not attach raw source URLs as labels.
 - Output: successful calls include both `receipt_id` and `explorer`, where `explorer` is `https://explorer.livylabs.xyz/?q=<receipt_id>` with the actual receipt id substituted
 - Auth: protected MCP requests require `Authorization: Bearer <livy_oauth_access_token>` with the exact `tool:fetch_source` scope, configured issuer, and resolver MCP endpoint audience. Authentication is performed once at the HTTP boundary and its context is reused by tool dispatch.
 - Discovery: unauthenticated MCP requests return HTTP `401` with `WWW-Authenticate` pointing at the protected-resource metadata URL. After OAuth, clients can call `initialize`, `notifications/initialized`, and `tools/list` with the bearer token. The tool implementation keeps `_meta["mcp/www_authenticate"]` compatibility for contexts that reach tool dispatch directly.
-- Transport: stateful sessions are disabled; requests use stateless JSON responses, avoiding unbounded in-memory sessions and replica stickiness. Requests are deadline-bound by `LIVY_RESOLVER_MCP_TIMEOUT_SECS`.
-- Host/origin policy: `LIVY_RESOLVER_MCP_ALLOWED_HOSTS` and `LIVY_RESOLVER_MCP_ALLOWED_ORIGINS` are non-empty allow-lists. Defaults accept only local development values; production must explicitly set its public hostname and browser origins.
+- Transport: stateful sessions are disabled; requests use stateless JSON responses, avoiding unbounded in-memory sessions and replica stickiness. Requests are deadline-bound by `LIVY_RESOLVER_MCP_TIMEOUT_SECS`; deadline, disconnect, and shutdown cancellation propagate into the tool operation so upstream and side-effect work does not continue detached.
+- Host/origin policy: `LIVY_RESOLVER_MCP_ALLOWED_HOSTS` and `LIVY_RESOLVER_MCP_ALLOWED_ORIGINS` are non-empty allow-lists. Defaults accept only local development values; production must explicitly set its public hostname and browser origins. Origins are matched by exact scheme, host, and effective port, so `https://app.example` permits port 443 but not port 4444.
 - ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `title` and `securitySchemes`, `_meta.securitySchemes`, short invocation status text, and open-world annotations. It is explicitly not read-only and is marked destructive because it can debit credits, store a receipt, and create irreversible public provenance.
 
 Use when the prompt contains `source: <url>`, "only take this source", "source of truth", or an explicitly required URL. Pass the exact URL, don't search or substitute.

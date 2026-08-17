@@ -143,9 +143,11 @@ pub async fn search_post(
     State(fetcher): State<Arc<Fetcher>>,
     Extension(auth_context): Extension<ResolverAuthContext>,
     Extension(credits): Extension<Arc<ResolverCreditsClient>>,
+    Extension(egress): Extension<Arc<EgressPolicy>>,
     ApiJson(payload): ApiJson<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
     payload.validate_for(ProductRoute::Search)?;
+    egress.require_actual_fetch_capability().await?;
     debit_product_route(
         &credits,
         &auth_context,

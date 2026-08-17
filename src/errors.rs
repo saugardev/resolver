@@ -30,6 +30,8 @@ pub enum FetchError {
     PaymentRequired(String),
     #[error("Credit authorization failed")]
     Credits(String),
+    #[error("Egress enforcement unavailable")]
+    EgressUnavailable(String),
     #[error("Snapshot failed")]
     Snapshot(#[from] SnapshotError),
 }
@@ -149,6 +151,11 @@ impl IntoResponse for FetchError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "credit_service_unavailable",
                 "Credit authorization service is unavailable".to_string(),
+            ),
+            FetchError::EgressUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "egress_policy_unavailable",
+                "Source fetching is unavailable until egress enforcement is ready".to_string(),
             ),
             FetchError::Snapshot(_) => (
                 StatusCode::BAD_GATEWAY,
